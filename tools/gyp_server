@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+# Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to
+# deal in the Software without restriction, including without limitation the
+# rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+# sell copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+# IN THE SOFTWARE.
+
+import glob
+import os
+import shlex
+import sys
+
+script_dir = os.path.dirname(__file__)
+root       = os.path.normpath(os.path.join(script_dir, os.pardir))
+
+sys.path.insert(0, os.path.join(root, 'tools', 'gyp', 'pylib'))
+import gyp
+
+# Directory within which we want all generated files (including Makefiles)
+# to be written.
+output_dir = os.path.join(os.path.abspath(root), 'out')
+
+def run_gyp(args):
+  rc = gyp.main(args)
+  if rc != 0:
+    print 'Error running GYP'
+    sys.exit(rc)
+
+if __name__ == '__main__':
+  args = sys.argv[1:]
+
+  # GYP bug.
+  # On msvs it will crash if it gets an absolute path.
+  # On Mac/make it will crash if it doesn't get an absolute path.
+  if sys.platform == 'win32':
+    args.append(os.path.join(root, 'server.gyp'))
+    common_fn  = os.path.join(root, 'common.gypi')
+    options_fn = os.path.join(root, 'config.gypi')
+  else:
+    args.append(os.path.join(os.path.abspath(root), 'server.gyp'))
+    common_fn  = os.path.join(os.path.abspath(root), 'common.gypi')
+    options_fn = os.path.join(os.path.abspath(root), 'config.gypi')
+
+  if os.path.exists(common_fn):
+    args.extend(['-I', common_fn])
+
+  if os.path.exists(options_fn):
+    args.extend(['-I', options_fn])
+
+  args.append('--depth=' + root)
+
+  # There's a bug with windows which doesn't allow this feature.
+  if sys.platform != 'win32' and 'ninja' not in args:
+    # Tell gyp to write the Makefiles into output_dir
+    args.extend(['--generator-output', output_dir])
+
+    # Tell make to write its output into the same dir
+    args.extend(['-Goutput_dir=' + output_dir])
+
+  args.append('-Dcomponent=static_library')
+  args.append('-Dlibrary=static_library')
+  gyp_args = list(args)
+  run_gyp(gyp_args)
+

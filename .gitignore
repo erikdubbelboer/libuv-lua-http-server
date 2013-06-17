@@ -1,0 +1,4 @@
+config.gypi
+config.mk
+out/
+server
