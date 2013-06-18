@@ -1,3 +1,23 @@
+//
+// Copyright Erik Dubbelboer. and other contributors. All rights reserved.
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to
+// deal in the Software without restriction, including without limitation the
+// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+// sell copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+// IN THE SOFTWARE.
+//
 
 #include <stdlib.h>  /* malloc(), free()     */
 #include <assert.h>  /* assert()             */
@@ -28,7 +48,9 @@ typedef struct webio_s {
   uv_write_t  write_req;
   char*       write_data;
 
-  char keep_alive:1;
+#ifdef HAVE_KEEP_ALIVE
+  int keep_alive;
+#endif
   
   char*  header;
   size_t header_size;
@@ -86,15 +108,29 @@ static void after_write(uv_write_t* req, int status) {
 
   free(io->write_data);
 
-  if (!io->keep_alive && !uv_is_closing((uv_handle_t*)req->handle)) {
-    uv_close((uv_handle_t*)req->handle, after_close);
+  /* Stop the write timeout. */
+  uv_timer_stop(&io->timeout);
+
+  if (!uv_is_closing((uv_handle_t*)req->handle)) {
+#ifdef HAVE_KEEP_ALIVE
+    if (!io->keep_alive) {
+#endif
+    /* We prefer the client to disconnect so we don't end up with
+     * to many socket in the TIME_WAIT state. So set a timeout
+     * after which we close the socket.
+     */
+    uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+#ifdef HAVE_KEEP_ALIVE
+    }
+#endif
   }
 }
 
 
 void webserver_respond(webclient_t* client, char* response) {
   webio_t* io = client->_io;
-    
+
+  /* Start a write timeout. */
   uv_timer_start(&io->timeout, on_timeout, 2000, 0);
 
   if (response) {
@@ -109,7 +145,7 @@ void webserver_respond(webclient_t* client, char* response) {
       }
     }
   } else {
-    if (!io->keep_alive && !uv_is_closing((uv_handle_t*)&io->handle)) {
+    if (!uv_is_closing((uv_handle_t*)&io->handle)) {
       uv_close((uv_handle_t*)&io->handle, after_close);
     }
   }
@@ -119,9 +155,11 @@ void webserver_respond(webclient_t* client, char* response) {
 static int on_message_complete(http_parser *p) {
   webio_t* io = (webio_t*)p->data;
 
-  if (http_should_keep_alive(p) && (p->http_major > 0) && (p->http_minor > 0)) {
+#ifdef HAVE_KEEP_ALIVE
+  if (io->keep_alive && http_should_keep_alive(p) && (p->http_major > 0) && (p->http_minor > 0)) {
     io->keep_alive = 1;
   }
+#endif
 
   uv_timer_stop(&io->timeout);
 
@@ -142,7 +180,7 @@ static int on_body(http_parser *p, const char *buf, size_t len) {
 
 static int on_header_value(http_parser *p, const char *buf, size_t len) {
   webio_t* io = (webio_t*)p->data;
-  
+
   if (io->header) {
     strncat(io->header, buf, MIN(io->header_size - strlen(io->header), len));
   }
@@ -211,9 +249,14 @@ static int on_message_begin(http_parser *p) {
   io->client.agent[0]    = 0;
   io->client.referrer[0] = 0;
 
+#ifdef HAVE_KEEP_ALIVE
   io->keep_alive = 0;
+#endif
   
-  /* This will automatically stop the timer that might be running if this is a keep-alive connection. */
+  /* Start a read timer.
+   * This will automatically stop the timer that might be running
+   * if this is a keep-alive connection.
+   */
   uv_timer_start(&io->timeout, on_timeout, 2000, 0);
   
   return 0;
