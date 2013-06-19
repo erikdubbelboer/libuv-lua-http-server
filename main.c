@@ -61,6 +61,20 @@ static void lru_free(lru_entry_t* entry) {
 LRU_TYPE(lru_entry_s) scriptlru;
 
 LRU_GENERATE_STATIC(lru_entry_s, lru_compare, lru_free, lru)
+    
+
+char* lua_error_handler = 
+  "function __error__handler(err)\n"
+  "  local i = debug.getinfo(2,'nSl')\n"
+  "  if i and i.what == 'C' then\n"
+  "    i = debug.getinfo(3,'nSl')\n"
+  "  end\n"
+  "  if i then\n"
+  "    return err ..': '.. i.source .. ': ' .. i.currentline\n"
+  "  else\n"
+  "    return err\n"
+  "  end\n"
+  "end\n";
 
 
 static void write_response(webclient_t* web, int status, size_t size, const char* data) {
@@ -126,6 +140,11 @@ static void on_webserver_handle(webclient_t* web) {
 
     luaL_openlibs(entry->L);
 
+    luaL_loadbuffer(entry->L, lua_error_handler, strlen(lua_error_handler), "@error_handler");
+    lua_pcall(entry->L, 0, 0, 0);
+
+    lua_getglobal(entry->L, "__error__handler");
+
     if (luaL_loadfile(entry->L, entry->file + 1)) {
       free(entry);
 
@@ -164,7 +183,7 @@ static void on_webserver_handle(webclient_t* web) {
 
   lua_pushvalue(entry->L, -1);
 
-  if (lua_pcall(entry->L, 0, LUA_MULTRET, 0)) {
+  if (lua_pcall(entry->L, 0, 1, -2)) {
     error_500(web, lua_tostring(entry->L, -1));
     return;
   }
