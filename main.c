@@ -167,7 +167,7 @@ static void on_webserver_handle(webclient_t* web) {
   lua_pushstring(entry->L, web->url);
   lua_rawset    (entry->L, -3);
   lua_pushstring(entry->L, "method");
-  lua_pushstring(entry->L, webserver_method(web->method));
+  lua_pushstring(entry->L, http_method_str(web->method));
   lua_rawset    (entry->L, -3);
   lua_pushstring(entry->L, "cookie");
   lua_pushstring(entry->L, web->cookie);

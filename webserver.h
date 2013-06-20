@@ -69,7 +69,6 @@ int  webserver_start2 (webserver_t* server, uv_pipe_t* pipe);
 int  webserver_stop   (webserver_t* server);
 
 const char* webserver_reason(int status);
-const char* webserver_method(int method);
 
 
 #endif /* _WEBSERVER_H_ */

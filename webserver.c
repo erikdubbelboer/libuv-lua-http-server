@@ -553,15 +553,3 @@ const char* webserver_reason(int status) {
   }
 }
 
-
-const char* webserver_method(int method) {
-  if (0) {
-    /* Empty if to allow for else if in define. */
-  }
-#define XX(num, name, string) else if (method == num) { return #string; }
-    HTTP_METHOD_MAP(XX)
-#undef XX
-
-  return "UNKNOWN";
-}
-
