@@ -33,6 +33,7 @@ struct webclient_s;
 
 typedef void (*webserver_handle_cb)(struct webclient_s* client);
 typedef void (*webserver_close_cb )(struct webclient_s* client);
+typedef void (*webserver_free_cb  )(char* buffer);
 
 
 typedef struct webserver_s {
@@ -43,7 +44,8 @@ typedef struct webserver_s {
   uint32_t connected;  /* Number of connected clients. */
 
   /* Fields for internal use. */
-  uv_stream_t* _handle;
+  uv_stream_t*       _handle;
+  struct ssl_ctx_st* _ssl;
 } webserver_t;
 
 
@@ -63,10 +65,12 @@ typedef struct webclient_s {
 } webclient_t;
 
 
-void webserver_respond(webclient_t* client, char* response);
-int  webserver_start  (webserver_t* server, const char* ip, int port);
-int  webserver_start2 (webserver_t* server, uv_pipe_t* pipe);
-int  webserver_stop   (webserver_t* server);
+void        webserver_respond  (webclient_t* client, char* response, webserver_free_cb free_cb);
+int         webserver_start    (webserver_t* server, const char* ip, int port);
+int         webserver_start2   (webserver_t* server, uv_pipe_t* pipe);
+int         webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* chain_file, const char* key_file, const char* cipher_list);
+int         webserver_stop     (webserver_t* server);
+const char* webserver_error    (webserver_t* server);
 
 const char* webserver_reason(int status);
 

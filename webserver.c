@@ -25,6 +25,8 @@
 #include <ctype.h>   /* tolower()            */
 
 #include "http_parser.h"
+#include "openssl/ssl.h"
+#include "openssl/err.h"
 
 #include "webserver.h"
 
@@ -40,13 +42,20 @@ typedef struct webio_s {
     uv_tcp_t  tcp;
   } handle;
 
+  SSL* ssl;
+  BIO* ssl_write;
+  BIO* ssl_read;
+
   webserver_t* server;
 
   http_parser parser;
   uv_timer_t  timeout;
   
-  uv_write_t  write_req;
-  char*       write_data;
+  char*             write_data;
+  int               write_active;
+  webserver_free_cb write_free;
+
+  int closing;
 
 #ifdef HAVE_KEEP_ALIVE
   int keep_alive;
@@ -59,7 +68,15 @@ typedef struct webio_s {
 } webio_t;
 
 
+typedef struct webwrite_s {
+  webio_t*   io;
+  char*      data;
+  uv_write_t req;
+} webwrite_t;
+
+
 static http_parser_settings parser_settings;
+static int                  ssl_init = 0;
 
 
 static void after_close_timeout(uv_handle_t* handle) {
@@ -73,6 +90,10 @@ static void after_close(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
 
   --io->server->connected;
+
+  //BIO_vfree(io->ssl_read);
+  //BIO_vfree(io->ssl_write);
+  SSL_free(io->ssl);
 
   io->server->close_cb(&io->client);
 
@@ -98,7 +119,7 @@ static void on_timeout(uv_timer_t* handle, int status) {
 
 
 static void after_write(uv_write_t* req, int status) {
-  webio_t* io = (webio_t*)req->data;
+  webwrite_t* w = (webwrite_t*)req->data;
 
   /* status will be set to UV_ECANCELED when the connection
    * is closed durint the write.
@@ -106,28 +127,70 @@ static void after_write(uv_write_t* req, int status) {
   assert((status == 0) || (status != UV_ECANCELED));
   (void)status;  /* For release builds. */
 
-  free(io->write_data);
+  if (w->data) {
+    free(w->data);
+  }
 
-  /* Stop the write timeout. */
-  uv_timer_stop(&io->timeout);
-
-  if (!uv_is_closing((uv_handle_t*)req->handle)) {
-#ifdef HAVE_KEEP_ALIVE
-    if (!io->keep_alive) {
-#endif
-    /* We prefer the client to disconnect so we don't end up with
-     * to many socket in the TIME_WAIT state. So set a timeout
-     * after which we close the socket.
-     */
-    uv_timer_start(&io->timeout, on_timeout, 2000, 0);
-#ifdef HAVE_KEEP_ALIVE
+  if ((--w->io->write_active == 0) && (w->io->closing)) {
+    if (w->io->write_free) {
+      w->io->write_free(w->io->write_data);
     }
+
+    w->io->closing = 0;
+
+    /* Stop the write timeout. */
+    uv_timer_stop(&w->io->timeout);
+
+    if (!uv_is_closing((uv_handle_t*)req->handle)) {
+#ifdef HAVE_KEEP_ALIVE
+      if (!w->io->keep_alive) {
 #endif
+        /* We prefer the client to disconnect so we don't end up with
+         * to many socket in the TIME_WAIT state. So set a timeout
+         * after which we close the socket.
+         */
+        uv_timer_start(&w->io->timeout, on_timeout, 2000, 0);
+#ifdef HAVE_KEEP_ALIVE
+      }
+#endif
+    }
+  }
+
+  free(w);
+}
+
+
+static void flush_write_bio(webio_t* io) {
+  char buffer[1024 * 4];
+  int  bread;
+
+  while ((bread = BIO_read(io->ssl_write, buffer, sizeof(buffer))) > 0) {
+    webwrite_t* w = malloc(sizeof(*w));
+
+    w->io   = io;
+    w->data = malloc(bread);
+    memcpy(w->data, buffer, bread);
+
+    w->req.data = w;
+
+    uv_buf_t buf = uv_buf_init(w->data, bread);
+  
+    if (uv_write(&w->req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
+      free(w);
+      free(w->data);
+
+      if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+        uv_close((uv_handle_t*)&io->handle, after_close);
+      }
+    } else {
+      ++io->write_active;
+    }
   }
 }
 
 
-void webserver_respond(webclient_t* client, char* response) {
+
+void webserver_respond(webclient_t* client, char* response, webserver_free_cb free_cb) {
   webio_t* io = client->_io;
 
   /* Start a write timeout. */
@@ -135,13 +198,38 @@ void webserver_respond(webclient_t* client, char* response) {
 
   if (response) {
     io->write_data = response;
-    uv_buf_t buf   = uv_buf_init(response, strlen(response));
-  
-    if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
-      free(response);
+    io->write_free = free_cb;
 
-      if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-        uv_close((uv_handle_t*)&io->handle, after_close);
+    io->closing = 1;
+
+    if (io->ssl) {
+      if (SSL_write(io->ssl, response, strlen(response)) <= 0) {
+        free_cb(response);
+
+        if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+          uv_close((uv_handle_t*)&io->handle, after_close);
+        }
+      } else {
+        flush_write_bio(io);
+      }
+    } else {
+      webwrite_t* w = malloc(sizeof(*w));
+
+      w->io       = io;
+      w->data     = 0;
+      w->req.data = w;
+
+      ++io->write_active;
+
+      uv_buf_t buf = uv_buf_init(response, strlen(response));
+    
+      if (uv_write(&w->req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
+        free(w);
+        free_cb(response);
+
+        if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+          uv_close((uv_handle_t*)&io->handle, after_close);
+        }
       }
     }
   } else {
@@ -233,7 +321,7 @@ static int on_url(http_parser *p, const char *buf, size_t len) {
 
 static int on_message_begin(http_parser *p) {
   webio_t* io = (webio_t*)p->data;
-  
+
   struct sockaddr_in sockname;
   int                namelen = sizeof(sockname);
 
@@ -267,12 +355,31 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
   webio_t* io = (webio_t*)tcp->data;
 
   if (nread >= 0) {
-    buf.base[nread] = 0;
+    if (io->ssl) {
+      BIO_write(io->ssl_read, buf.base, nread);
 
-    ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buf.base, nread);
+      if (!SSL_is_init_finished(io->ssl)) {
+        SSL_accept(io->ssl);
+        flush_write_bio(io);
+      } else {
+        char buffer[1024 * 4];
+        int  bread;
 
-    if (parsed < nread) {
-      uv_close((uv_handle_t*)&io->handle, after_close);
+        while ((bread = SSL_read(io->ssl, buffer, sizeof(buffer))) > 0) {
+          ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buffer, bread);
+
+          if (parsed < bread) {
+            uv_close((uv_handle_t*)&io->handle, after_close);
+            break;
+          }
+        }
+      }
+    } else {
+      ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buf.base, nread);
+
+      if (parsed < nread) {
+        uv_close((uv_handle_t*)&io->handle, after_close);
+      }
     }
   } else {
     uv_close((uv_handle_t*)&io->handle, after_close);
@@ -299,11 +406,25 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
 
     http_parser_init(&io->parser, HTTP_REQUEST);
 
-    io->parser.data     = io;
-    io->write_req.data  = io;
-    io->timeout.data    = io;
-    io->client._io      = io;
-    
+    io->parser.data  = io;
+    io->timeout.data = io;
+    io->client._io   = io;
+
+    if (io->server->_ssl) {
+      io->ssl       = SSL_new(io->server->_ssl);
+
+      if (!io->ssl) {
+        uv_close((uv_handle_t*)&io->handle, after_close);
+        return;
+      }
+
+      io->ssl_write = BIO_new(BIO_s_mem());
+      io->ssl_read  = BIO_new(BIO_s_mem());
+
+      SSL_set_bio(io->ssl, io->ssl_read, io->ssl_write);
+      SSL_set_accept_state(io->ssl);
+    }
+
     if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
       uv_close((uv_handle_t*)&io->handle, after_close);
     } else {
@@ -378,6 +499,7 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
   start_common();
 
   server->connected = 0;
+  server->_ssl      = 0;
   server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
 
   memset(server->_handle, 0, sizeof(uv_tcp_t));
@@ -407,11 +529,84 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
   start_common();
 
   server->connected = 0;
+  server->_ssl      = 0;
   server->_handle   = (uv_stream_t*)pipe;
 
   server->_handle->data = server;
   
   if (uv_read2_start(server->_handle, on_alloc, on_pipe_connection) != 0) {
+    return 1;
+  }
+
+  return 0;
+}
+
+
+static int start_common_ssl(webserver_t* server, const char* chain_file, const char* key_file, const char* cipher_list) {
+  if (!ssl_init) {
+    SSL_library_init();
+  
+    ERR_load_crypto_strings();
+    ERR_load_SSL_strings();
+
+    ssl_init = 1;
+  }
+
+  server->_ssl = SSL_CTX_new(SSLv23_server_method());
+
+  if (!server->_ssl) {
+    return 1;
+  }
+
+  if (SSL_CTX_use_certificate_chain_file(server->_ssl, chain_file) != 1) {
+    return 1;
+  }
+
+  if (SSL_CTX_use_PrivateKey_file(server->_ssl, key_file, SSL_FILETYPE_PEM) != 1) {
+    return 1;
+  }
+
+  if (SSL_CTX_check_private_key(server->_ssl) != 1) {
+    return 1;
+  }
+  
+  SSL_CTX_set_verify(server->_ssl, SSL_VERIFY_NONE, NULL); // TODO: No verify!
+  SSL_CTX_set_session_cache_mode(server->_ssl, SSL_SESS_CACHE_OFF); // TODO: no caching!
+
+  if (SSL_CTX_set_cipher_list(server->_ssl, cipher_list) != 1) {
+    return 1;
+  }
+
+  return 0;
+}
+
+
+int webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* chain_file, const char* key_file, const char* cipher_list) {
+  assert(server->handle_cb);
+  assert(server->close_cb );
+
+  start_common();
+
+  if (start_common_ssl(server, chain_file, key_file, cipher_list) != 0) {
+    return 1;
+  }
+
+  server->connected = 0;
+  server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
+
+  memset(server->_handle, 0, sizeof(uv_tcp_t));
+
+  server->_handle->data = server;
+
+  if (uv_tcp_init(server->loop, (uv_tcp_t*)server->_handle) != 0) {
+    return 1;
+  }
+
+  if (uv_tcp_bind((uv_tcp_t*)server->_handle, uv_ip4_addr(ip, port)) != 0) {
+    return 1;
+  }
+
+  if (uv_listen(server->_handle, 511, on_tcp_connection) != 0) {
     return 1;
   }
 
@@ -431,6 +626,23 @@ int webserver_stop(webserver_t* server) {
   } else {
     return uv_read_stop(server->_handle);
   }
+}
+
+
+const char* webserver_error(webserver_t* server) {
+  uv_err_t uverr = uv_last_error(server->loop);
+
+  if (uverr.code != UV_OK) {
+    return uv_strerror(uverr);
+  }
+
+  unsigned long sslerr = ERR_get_error();
+
+  if (sslerr != 0) {
+    return ERR_error_string(sslerr, 0);
+  }
+
+  return 0;
 }
 
 

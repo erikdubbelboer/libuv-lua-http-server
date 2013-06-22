@@ -98,7 +98,7 @@ static void write_response(webclient_t* web, int status, size_t size, const char
 
   memcpy(buffer + strlen(buffer), data, size);
  
-  webserver_respond(web, buffer);
+  webserver_respond(web, buffer, (webserver_free_cb)free);
 }
 
 
@@ -107,7 +107,7 @@ static void error_500(webclient_t* web, const char* message) {
 }
 
 
-static void on_webserver_handle(webclient_t* web) {
+static void on_webserver_handle_common(webclient_t* web, int https) {
   char file[512];
 
   strncpy(file, web->url, 511);
@@ -178,6 +178,9 @@ static void on_webserver_handle(webclient_t* web) {
   lua_pushstring(entry->L, "referrer");
   lua_pushstring(entry->L, web->referrer);
   lua_rawset    (entry->L, -3);
+  lua_pushstring(entry->L, "https");
+  lua_pushnumber(entry->L, https);
+  lua_rawset    (entry->L, -3);
 
   lua_setglobal(entry->L, "request");
 
@@ -202,6 +205,16 @@ static void on_webserver_handle(webclient_t* web) {
 }
 
 
+static void on_webserver_handle_http(webclient_t* web) {
+  on_webserver_handle_common(web, 0);
+}
+
+
+static void on_webserver_handle_https(webclient_t* web) {
+  on_webserver_handle_common(web, 1);
+}
+
+
 static void on_webserver_close(webclient_t* web) {
   (void)web;
 }
@@ -219,11 +232,19 @@ int main(int argc, char* argv[]) {
     printf("could not load config file\n");
     exit(1);
   }
+  
+  const char* http_ip        = json_object_dotget_string(config, "http.ip"      );
+  int         http_port      = json_object_dotget_number(config, "http.port"    );
+  const char* https_ip       = json_object_dotget_string(config, "https.ip"     );
+  int         https_port     = json_object_dotget_number(config, "https.port"   );
+  const char* https_pem      = json_object_dotget_string(config, "https.pem"    );
+  const char* https_key      = json_object_dotget_string(config, "https.key"    );
+  const char* https_ciphers  = json_object_dotget_string(config, "https.ciphers");
 
-  const char* ip   = json_object_get_string(config, "ip"  );
-  int         port = json_object_get_number(config, "port");
-
-  if (!ip || (port <= 0)) {
+  if (!http_ip  || (http_port  <= 0) ||
+      !https_ip || (https_port <= 0) ||
+      !https_pem || !https_key || !https_ciphers
+  ) {
     printf("invalid config\n");
     exit(1);
   }
@@ -241,13 +262,26 @@ int main(int argc, char* argv[]) {
   uv_loop_t* loop = uv_default_loop();
 
 
-  webserver_t webserver;
+  webserver_t http_server;
 
-  webserver.loop      = loop;
-  webserver.handle_cb = on_webserver_handle;
-  webserver.close_cb  = on_webserver_close;
+  http_server.loop      = loop;
+  http_server.handle_cb = on_webserver_handle_http;
+  http_server.close_cb  = on_webserver_close;
   
-  UV_CHECK(webserver_start(&webserver, ip, port));
+  UV_CHECK(webserver_start(&http_server, http_ip, http_port));
+
+
+  webserver_t https_server;
+  int         err;
+
+  https_server.loop      = loop;
+  https_server.handle_cb = on_webserver_handle_https;
+  https_server.close_cb  = on_webserver_close;
+
+  if ((err = webserver_start_ssl(&https_server, https_ip, https_port, https_pem, https_key, https_ciphers)) != 0) {
+    printf("%s\n", webserver_error(&https_server));
+    exit(1);
+  }
 
 
   uv_run(loop, UV_RUN_DEFAULT);
