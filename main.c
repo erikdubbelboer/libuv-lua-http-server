@@ -96,7 +96,7 @@ static void write_response(webclient_t* web, int status, size_t size, const char
   assert(n < 4096);
   (void)n;  /* For release builds. */
 
-  memcpy(buffer + strlen(buffer), data, size);
+  memcpy(buffer + strlen(buffer), data, size + 1);
  
   webserver_respond(web, buffer, (webserver_free_cb)free);
 }
@@ -237,13 +237,12 @@ int main(int argc, char* argv[]) {
   int         http_port      = json_object_dotget_number(config, "http.port"    );
   const char* https_ip       = json_object_dotget_string(config, "https.ip"     );
   int         https_port     = json_object_dotget_number(config, "https.port"   );
-  const char* https_pem      = json_object_dotget_string(config, "https.pem"    );
-  const char* https_key      = json_object_dotget_string(config, "https.key"    );
+  const char* https_pemfile  = json_object_dotget_string(config, "https.pemfile");
   const char* https_ciphers  = json_object_dotget_string(config, "https.ciphers");
 
   if (!http_ip  || (http_port  <= 0) ||
       !https_ip || (https_port <= 0) ||
-      !https_pem || !https_key || !https_ciphers
+      !https_pemfile || !https_ciphers
   ) {
     printf("invalid config\n");
     exit(1);
@@ -278,7 +277,7 @@ int main(int argc, char* argv[]) {
   https_server.handle_cb = on_webserver_handle_https;
   https_server.close_cb  = on_webserver_close;
 
-  if ((err = webserver_start_ssl(&https_server, https_ip, https_port, https_pem, https_key, https_ciphers)) != 0) {
+  if ((err = webserver_start_ssl(&https_server, https_ip, https_port, https_pemfile, https_ciphers)) != 0) {
     printf("%s\n", webserver_error(&https_server));
     exit(1);
   }

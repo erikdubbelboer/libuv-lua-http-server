@@ -75,6 +75,9 @@ typedef struct webwrite_s {
 } webwrite_t;
 
 
+static void flush_write_bio(webio_t* io);
+
+
 static http_parser_settings parser_settings;
 static int                  ssl_init = 0;
 
@@ -91,9 +94,8 @@ static void after_close(uv_handle_t* handle) {
 
   --io->server->connected;
 
-  //BIO_vfree(io->ssl_read);
-  //BIO_vfree(io->ssl_write);
   SSL_free(io->ssl);
+  ERR_clear_error();
 
   io->server->close_cb(&io->client);
 
@@ -134,9 +136,8 @@ static void after_write(uv_write_t* req, int status) {
   if ((--w->io->write_active == 0) && (w->io->closing)) {
     if (w->io->write_free) {
       w->io->write_free(w->io->write_data);
+      w->io->write_free = 0;
     }
-
-    w->io->closing = 0;
 
     /* Stop the write timeout. */
     uv_timer_stop(&w->io->timeout);
@@ -149,8 +150,12 @@ static void after_write(uv_write_t* req, int status) {
          * to many socket in the TIME_WAIT state. So set a timeout
          * after which we close the socket.
          */
-        uv_timer_start(&w->io->timeout, on_timeout, 2000, 0);
+        uv_timer_start(&w->io->timeout, on_timeout, 1000, 0);
 #ifdef HAVE_KEEP_ALIVE
+      } else {
+        w->io->closing = 0;
+
+        uv_timer_start(&w->io->timeout, on_timeout, w->io->server->keepalive_timeout, 0);
       }
 #endif
     }
@@ -194,7 +199,7 @@ void webserver_respond(webclient_t* client, char* response, webserver_free_cb fr
   webio_t* io = client->_io;
 
   /* Start a write timeout. */
-  uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+  uv_timer_start(&io->timeout, on_timeout, io->server->write_timeout, 0);
 
   if (response) {
     io->write_data = response;
@@ -203,15 +208,38 @@ void webserver_respond(webclient_t* client, char* response, webserver_free_cb fr
     io->closing = 1;
 
     if (io->ssl) {
-      if (SSL_write(io->ssl, response, strlen(response)) <= 0) {
-        free_cb(response);
+      char*   offset  = response;
+      ssize_t towrite = strlen(response);
 
-        if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-          uv_close((uv_handle_t*)&io->handle, after_close);
+      while (towrite > 0) {
+        ERR_clear_error();
+        ssize_t r = SSL_write(io->ssl, offset, towrite);
+
+        if (r <= 0) {
+          int ssl_error = SSL_get_error(io->ssl, r);
+
+          if (ssl_error == SSL_ERROR_WANT_WRITE) {
+            flush_write_bio(io);
+          } else {
+            unsigned long err;
+           
+            while ((err = ERR_get_error())) {
+              printf("SSL_write(): SSL_get_error() = %d, SSL_write() = %zd msg = %s\n", ssl_error, r, ERR_error_string(err, 0));
+            }
+        
+            free_cb(response);
+    
+            if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+              uv_close((uv_handle_t*)&io->handle, after_close);
+            }
+          }
+        } else {
+          towrite -= r;
+          offset  += r;
         }
-      } else {
-        flush_write_bio(io);
       }
+            
+      flush_write_bio(io);
     } else {
       webwrite_t* w = malloc(sizeof(*w));
 
@@ -356,14 +384,34 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
 
   if (nread >= 0) {
     if (io->ssl) {
-      BIO_write(io->ssl_read, buf.base, nread);
+      assert(BIO_write(io->ssl_read, buf.base, nread)  == nread);
 
       if (!SSL_is_init_finished(io->ssl)) {
-        SSL_accept(io->ssl);
+        int r = SSL_accept(io->ssl);
+
+        if (r <= 0) {
+          int ssl_error = SSL_get_error(io->ssl, r);
+
+          if ((ssl_error == SSL_ERROR_WANT_READ) ||
+              (ssl_error == SSL_ERROR_WANT_WRITE)) {
+            ERR_clear_error();
+          } else {
+            unsigned long err;
+
+            while ((err = ERR_get_error())) {
+              printf("SSL_accept(): SSL_get_error() = %d, SSL_accept() = %d msg = %s\n", ssl_error, r, ERR_error_string(err, 0));
+            }
+        
+            uv_close((uv_handle_t*)&io->handle, after_close);
+          }
+        }
+            
         flush_write_bio(io);
-      } else {
-        char buffer[1024 * 4];
-        int  bread;
+      }
+
+      if (SSL_is_init_finished(io->ssl)) {
+        char    buffer[1024 * 4];
+        ssize_t bread;
 
         while ((bread = SSL_read(io->ssl, buffer, sizeof(buffer))) > 0) {
           ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buffer, bread);
@@ -372,6 +420,21 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
             uv_close((uv_handle_t*)&io->handle, after_close);
             break;
           }
+        }
+
+        int ssl_error = SSL_get_error(io->ssl, bread);
+
+        if ((ssl_error == SSL_ERROR_WANT_READ) ||
+            (ssl_error == SSL_ERROR_WANT_WRITE)) {
+          ERR_clear_error();
+        } else {
+          unsigned long err;
+
+          while ((err = ERR_get_error())) {
+            printf("SSL_read(): SSL_get_error() = %d, SSL_read() = %zd msg = %s\n", ssl_error, bread, ERR_error_string(err, 0));
+          }
+      
+          uv_close((uv_handle_t*)&io->handle, after_close);
         }
       }
     } else {
@@ -402,7 +465,7 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
     uv_close((uv_handle_t*)&io->handle, after_close);
   } else {
     uv_timer_init(io->server->loop, &io->timeout);
-    uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+    uv_timer_start(&io->timeout, on_timeout, io->server->read_timeout, 0);
 
     http_parser_init(&io->parser, HTTP_REQUEST);
 
@@ -477,7 +540,7 @@ static void on_pipe_connection(uv_pipe_t *handle, ssize_t nread, uv_buf_t buf, u
 }
 
 
-static void start_common() {
+static void start_common(webserver_t* server) {
   /* It doesn't matter if this happens more then once when starting multiple webservers.
    * No internal state or anything is stored so it will always set the struct to the same state.
    */
@@ -489,6 +552,19 @@ static void start_common() {
   parser_settings.on_header_field     = on_header_field;
   parser_settings.on_url              = on_url;
   parser_settings.on_message_begin    = on_message_begin;
+
+
+  if (!server->read_timeout) {
+    server->read_timeout = WEBSERVER_READ_TIMEOUT;
+  }
+  if (!server->write_timeout) {
+    server->write_timeout = WEBSERVER_WRITE_TIMEOUT;
+  }
+#ifdef HAVE_KEEP_ALIVE
+  if (!server->keepalive_timeout) {
+    server->keepalive_timeout = WEBSERVER_KEEPALIVE_TIMEOUT;
+  }
+#endif
 }
 
 
@@ -496,7 +572,7 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common();
+  start_common(server);
 
   server->connected = 0;
   server->_ssl      = 0;
@@ -526,7 +602,7 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common();
+  start_common(server);
 
   server->connected = 0;
   server->_ssl      = 0;
@@ -542,27 +618,31 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
 }
 
 
-static int start_common_ssl(webserver_t* server, const char* chain_file, const char* key_file, const char* cipher_list) {
+static int start_common_ssl(webserver_t* server, const char* pemfile, const char* ciphers) {
   if (!ssl_init) {
     SSL_library_init();
-  
-    ERR_load_crypto_strings();
-    ERR_load_SSL_strings();
+    SSL_load_error_strings();  
 
     ssl_init = 1;
   }
 
   server->_ssl = SSL_CTX_new(SSLv23_server_method());
 
+  if (!(SSL_OP_NO_SSLv2 & SSL_CTX_set_options(server->_ssl, SSL_OP_NO_SSLv2))) {
+    return 1;
+  }
+
+  SSL_CTX_set_session_cache_mode(server->_ssl, SSL_SESS_CACHE_OFF);
+
   if (!server->_ssl) {
     return 1;
   }
 
-  if (SSL_CTX_use_certificate_chain_file(server->_ssl, chain_file) != 1) {
+  if (SSL_CTX_use_certificate_file(server->_ssl, pemfile, SSL_FILETYPE_PEM) != 1) {
     return 1;
   }
 
-  if (SSL_CTX_use_PrivateKey_file(server->_ssl, key_file, SSL_FILETYPE_PEM) != 1) {
+  if (SSL_CTX_use_PrivateKey_file(server->_ssl, pemfile, SSL_FILETYPE_PEM) != 1) {
     return 1;
   }
 
@@ -570,10 +650,7 @@ static int start_common_ssl(webserver_t* server, const char* chain_file, const c
     return 1;
   }
   
-  SSL_CTX_set_verify(server->_ssl, SSL_VERIFY_NONE, NULL); // TODO: No verify!
-  SSL_CTX_set_session_cache_mode(server->_ssl, SSL_SESS_CACHE_OFF); // TODO: no caching!
-
-  if (SSL_CTX_set_cipher_list(server->_ssl, cipher_list) != 1) {
+  if (SSL_CTX_set_cipher_list(server->_ssl, ciphers) != 1) {
     return 1;
   }
 
@@ -581,13 +658,13 @@ static int start_common_ssl(webserver_t* server, const char* chain_file, const c
 }
 
 
-int webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* chain_file, const char* key_file, const char* cipher_list) {
+int webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* pemfile, const char* ciphers) {
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common();
+  start_common(server);
 
-  if (start_common_ssl(server, chain_file, key_file, cipher_list) != 0) {
+  if (start_common_ssl(server, pemfile, ciphers) != 0) {
     return 1;
   }
 

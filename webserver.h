@@ -29,6 +29,12 @@
 #include "http_parser.h"
 
 
+/* Default timeouts in miliseconds. */
+#define WEBSERVER_READ_TIMEOUT      (60 *1000)
+#define WEBSERVER_WRITE_TIMEOUT     (360*1000)
+#define WEBSERVER_KEEPALIVE_TIMEOUT (5  *1000)
+
+
 struct webclient_s;
 
 typedef void (*webserver_handle_cb)(struct webclient_s* client);
@@ -41,6 +47,13 @@ typedef struct webserver_s {
   webserver_handle_cb handle_cb;
   webserver_close_cb  close_cb;
 
+  uint32_t read_timeout;      /* 0 means WEBSERVER_READ_TIMEOUT.      */
+  uint32_t write_timeout;     /* 0 means WEBSERVER_WRITE_TIMEOUT.     */
+#ifdef HAVE_KEEP_ALIVE
+  uint32_t keepalive_timeout; /* 0 means WEBSERVER_KEEPALIVE_TIMEOUT. */
+#endif
+
+  /* Readonly: */
   uint32_t connected;  /* Number of connected clients. */
 
   /* Fields for internal use. */
@@ -68,7 +81,7 @@ typedef struct webclient_s {
 void        webserver_respond  (webclient_t* client, char* response, webserver_free_cb free_cb);
 int         webserver_start    (webserver_t* server, const char* ip, int port);
 int         webserver_start2   (webserver_t* server, uv_pipe_t* pipe);
-int         webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* chain_file, const char* key_file, const char* cipher_list);
+int         webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* pamfile, const char* ciphers);
 int         webserver_stop     (webserver_t* server);
 const char* webserver_error    (webserver_t* server);
 
