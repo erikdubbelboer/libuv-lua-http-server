@@ -45,8 +45,9 @@ typedef struct webio_s {
   http_parser parser;
   uv_timer_t  timeout;
   
-  uv_write_t  write_req;
-  char*       write_data;
+  uv_write_t        write_req;
+  char*             write_data;
+  webserver_free_cb write_free;
 
 #ifdef HAVE_KEEP_ALIVE
   int keep_alive;
@@ -106,7 +107,7 @@ static void after_write(uv_write_t* req, int status) {
   assert((status == 0) || (status != UV_ECANCELED));
   (void)status;  /* For release builds. */
 
-  free(io->write_data);
+  io->write_free(io->write_data);
 
   /* Stop the write timeout. */
   uv_timer_stop(&io->timeout);
@@ -115,11 +116,18 @@ static void after_write(uv_write_t* req, int status) {
 #ifdef HAVE_KEEP_ALIVE
     if (!io->keep_alive) {
 #endif
-    /* We prefer the client to disconnect so we don't end up with
-     * to many socket in the TIME_WAIT state. So set a timeout
-     * after which we close the socket.
-     */
-    uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+      /* With http 1.0 client such as ApacheBench we need to close
+       * the connection our selves.
+       */
+      if ((io->parser.http_major <= 1) || (io->parser.http_minor == 0)) {
+        uv_close((uv_handle_t*)&io->handle, after_close);
+      } else {
+        /* We prefer the client to disconnect so we don't end up with
+         * to many socket in the TIME_WAIT state. So set a timeout
+         * after which we close the socket.
+         */
+        uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+      }
 #ifdef HAVE_KEEP_ALIVE
     }
 #endif
@@ -127,7 +135,7 @@ static void after_write(uv_write_t* req, int status) {
 }
 
 
-void webserver_respond(webclient_t* client, char* response) {
+void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb) {
   webio_t* io = client->_io;
 
   /* Start a write timeout. */
@@ -135,7 +143,8 @@ void webserver_respond(webclient_t* client, char* response) {
 
   if (response) {
     io->write_data = response;
-    uv_buf_t buf   = uv_buf_init(response, strlen(response));
+    io->write_free = free_cb;
+    uv_buf_t buf   = uv_buf_init(response, size);
   
     if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
       free(response);

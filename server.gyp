@@ -12,6 +12,7 @@
       ],
 
       'sources': [
+        'sds.c',
         'webserver.c',
         'main.c'
       ],

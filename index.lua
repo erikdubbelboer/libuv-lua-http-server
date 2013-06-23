@@ -1,5 +1,7 @@
 
-local response = [[
+response.headers["Content-Type"] = "text/html"
+
+response.body = [[
 <!doctype html>
 <html>
 <head>
@@ -11,14 +13,12 @@ local response = [[
 
 
 for key,value in pairs(request) do
-  response = response .. key .. ": " .. value .. "<br>"
+  response.body = response.body .. key .. ": " .. value .. "<br>"
 end
 
 
-response = response .. [[
+response.body = response.body .. [[
 </body>
 </html>
 ]]
-
-return response
 

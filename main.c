@@ -28,6 +28,7 @@
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
+#include "sds.h"
 #include "webserver.h"
 #include "lru.h"
 
@@ -77,8 +78,9 @@ char* lua_error_handler =
   "end\n";
 
 
-static void write_response(webclient_t* web, int status, size_t size, const char* data) {
-  char*  buffer = malloc(size + 4096);
+static void http_error(webclient_t* web, int status, const char* message) {
+  size_t size   = strlen(message);
+  char*  buffer = malloc(4096 + size);
   int    n      = sprintf(
     buffer,
     "HTTP/1.1 %d %s\r\n"
@@ -94,16 +96,11 @@ static void write_response(webclient_t* web, int status, size_t size, const char
   );
  
   assert(n < 4096);
-  (void)n;  /* For release builds. */
 
-  memcpy(buffer + strlen(buffer), data, size);
- 
-  webserver_respond(web, buffer);
-}
+  /* There will always be enough room for this. */
+  strcat(buffer, message);
 
-
-static void error_500(webclient_t* web, const char* message) {
-  write_response(web, 500, strlen(message), message);
+  webserver_respond(web, buffer, n + size, free);
 }
 
 
@@ -119,7 +116,7 @@ static void on_webserver_handle(webclient_t* web) {
   }
 
   if (strstr(file, "../")) {
-    error_500(web, "../ is not allowed");
+    http_error(web, 500, "../ is not allowed");
     return;
   }
 
@@ -148,7 +145,7 @@ static void on_webserver_handle(webclient_t* web) {
     if (luaL_loadfile(entry->L, entry->file + 1)) {
       free(entry);
 
-      error_500(web, lua_tostring(entry->L, -1));
+      http_error(web, 500, lua_tostring(entry->L, -1));
 
       lua_close(entry->L);
       return;
@@ -158,8 +155,10 @@ static void on_webserver_handle(webclient_t* web) {
   }
 
 
+  /* Push the request table on the stack. */
   lua_createtable(entry->L, 0, 6);
 
+  /* Fill it. */
   lua_pushstring(entry->L, "ip");
   lua_pushnumber(entry->L, web->ip);
   lua_rawset    (entry->L, -3);
@@ -179,26 +178,147 @@ static void on_webserver_handle(webclient_t* web) {
   lua_pushstring(entry->L, web->referrer);
   lua_rawset    (entry->L, -3);
 
+  /* Assign it to a global variable. */
   lua_setglobal(entry->L, "request");
+  
+  
+  /* Push the response table on the stack. */
+  lua_createtable(entry->L, 0, 6);
+  
+  lua_pushstring(entry->L, "headers");
 
+  /* Push the headers table on the stack. */
+  lua_createtable(entry->L, 0, 6);
+  
+  lua_pushstring(entry->L, "Content-Type");
+  lua_pushstring(entry->L, "text/html");
+  lua_rawset    (entry->L, -3);
+
+  /* Assign it to the headers field. */
+  lua_rawset    (entry->L, -3);
+  
+  lua_pushstring(entry->L, "body");
+  lua_pushstring(entry->L, "");
+  lua_rawset    (entry->L, -3);
+  lua_pushstring(entry->L, "status");
+  lua_pushnumber(entry->L, 200);
+  lua_rawset    (entry->L, -3);
+
+  /* Assign it to a global variable. */
+  lua_setglobal(entry->L, "response");
+
+
+  /* Push the main script function on the stack.
+   * (the on pushed by luaL_loadfile).
+   */
   lua_pushvalue(entry->L, -1);
 
   if (lua_pcall(entry->L, 0, 1, -2)) {
-    error_500(web, lua_tostring(entry->L, -1));
+    http_error(web, 500, lua_tostring(entry->L, -1));
+  
+    /* Return the stack to the starting state. */
+    lua_pop(entry->L, lua_gettop(entry->L) - 2);
+    return;
+  }
+
+  lua_getglobal(entry->L, "response");
+
+  if (!lua_istable(entry->L, -1)) {
+    http_error(web, 500, "global response is not a table");
+  
+    /* Return the stack to the starting state. */
+    lua_pop(entry->L, lua_gettop(entry->L) - 2);
+    return;
+  }
+
+  /* The the body. */
+  lua_pushstring(entry->L, "body");
+  lua_gettable(entry->L, -2);
+
+  if (!lua_isstring(entry->L, -1)) {
+    http_error(web, 500, "response.body is not a string");
+  
+    /* Return the stack to the starting state. */
+    lua_pop(entry->L, lua_gettop(entry->L) - 2);
     return;
   }
 
   size_t      body_size = lua_strlen  (entry->L, -1);
   const char* body      = lua_tostring(entry->L, -1);
+  
+  /* Pop the body of the stack. */
+  lua_pop(entry->L, 1);
+  
+  
+  /* Get the status code. */
+  lua_pushstring(entry->L, "status");
+  lua_gettable(entry->L, -2);
 
-  if (!body) {
-    error_500(web, "invalid return value");
+  if (!lua_isnumber(entry->L, -1)) {
+    http_error(web, 500, "response.status is not a number");
+  
+    /* Return the stack to the starting state. */
+    lua_pop(entry->L, lua_gettop(entry->L) - 2);
     return;
   }
 
-  write_response(web, 200, body_size, body);
+  int status = lua_tonumber(entry->L, -1);
 
+  /* Pop the status of the stack. */
   lua_pop(entry->L, 1);
+  
+
+  sds headers = sdsempty();
+
+  lua_pushstring(entry->L, "headers");
+  lua_gettable(entry->L, -2);
+  
+  /* Push the first key. */
+  lua_pushnil(entry->L);
+
+  while (lua_next(entry->L, -2) != 0) {
+    const char* key   = lua_tostring(entry->L, -2);
+    const char* value = lua_tostring(entry->L, -1);
+    
+    /* We don't allow setting the Content-Length header
+     * from the script.
+     */
+    if (strcasecmp(key, "content-length") != 0) {
+      headers = sdscatprintf(
+        headers,
+        "%s: %s\r\n",
+        key, value
+      );
+    }
+
+    /* Pop the value, keep the key for next. */
+    lua_pop(entry->L, 1);
+  }
+  
+  /* Pop the headers table. */
+  lua_pop(entry->L, 1);
+  
+
+  sds response = sdscatprintf(
+    sdsempty(),
+    "HTTP/1.1 %d %s\r\n"
+    "Content-Length: %zu\r\n"
+    "%s"
+    "\r\n",
+    status,
+    webserver_reason(status),
+    body_size,
+    headers
+  );
+
+  sdsfree(headers);
+
+  response = sdscatlen(response, body, body_size);
+
+  webserver_respond(web, response, sdslen(response), (webserver_free_cb)sdsfree);
+
+  /* Return the stack to the starting state. */
+  lua_pop(entry->L, lua_gettop(entry->L) - 2);
 }
 
 

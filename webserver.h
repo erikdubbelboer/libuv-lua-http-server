@@ -33,6 +33,7 @@ struct webclient_s;
 
 typedef void (*webserver_handle_cb)(struct webclient_s* client);
 typedef void (*webserver_close_cb )(struct webclient_s* client);
+typedef void (*webserver_free_cb  )(void* data);
 
 
 typedef struct webserver_s {
@@ -63,7 +64,7 @@ typedef struct webclient_s {
 } webclient_t;
 
 
-void webserver_respond(webclient_t* client, char* response);
+void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb);
 int  webserver_start  (webserver_t* server, const char* ip, int port);
 int  webserver_start2 (webserver_t* server, uv_pipe_t* pipe);
 int  webserver_stop   (webserver_t* server);
