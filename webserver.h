@@ -39,7 +39,7 @@ struct webclient_s;
 
 typedef void (*webserver_handle_cb)(struct webclient_s* client);
 typedef void (*webserver_close_cb )(struct webclient_s* client);
-typedef void (*webserver_free_cb  )(char* buffer);
+typedef void (*webserver_free_cb  )(void* buffer);
 
 
 typedef struct webserver_s {
@@ -67,7 +67,8 @@ typedef struct webclient_s {
 
   char url[1024];
 
-  uint8_t method;  /* One of the http_method enum members from http_parser.h */
+  uint8_t method;   /* One of the http_method enum members from http_parser.h */
+  uint8_t version;  /* HTTP version, (major * 10) + minor                     */
 
   char cookie  [1024*2];
   char agent   [1024];
@@ -78,7 +79,7 @@ typedef struct webclient_s {
 } webclient_t;
 
 
-void        webserver_respond  (webclient_t* client, char* response, webserver_free_cb free_cb);
+void        webserver_respond  (webclient_t* client, char* response, size_t size, webserver_free_cb free_cb);
 int         webserver_start    (webserver_t* server, const char* ip, int port);
 int         webserver_start2   (webserver_t* server, uv_pipe_t* pipe);
 int         webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* pamfile, const char* ciphers);

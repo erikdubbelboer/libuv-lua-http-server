@@ -146,11 +146,18 @@ static void after_write(uv_write_t* req, int status) {
 #ifdef HAVE_KEEP_ALIVE
       if (!w->io->keep_alive) {
 #endif
-        /* We prefer the client to disconnect so we don't end up with
-         * to many socket in the TIME_WAIT state. So set a timeout
-         * after which we close the socket.
+        /* With http 1.0 client such as ApacheBench we need to close
+         * the connection our selves.
          */
-        uv_timer_start(&w->io->timeout, on_timeout, 1000, 0);
+        if (w->io->client.version <= 10) {
+          uv_close((uv_handle_t*)&w->io->handle, after_close);
+        } else {
+          /* We prefer the client to disconnect so we don't end up with
+           * to many socket in the TIME_WAIT state. So set a timeout
+           * after which we close the socket.
+           */
+          uv_timer_start(&w->io->timeout, on_timeout, 1000, 0);
+        }
 #ifdef HAVE_KEEP_ALIVE
       } else {
         w->io->closing = 0;
@@ -195,7 +202,7 @@ static void flush_write_bio(webio_t* io) {
 
 
 
-void webserver_respond(webclient_t* client, char* response, webserver_free_cb free_cb) {
+void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb) {
   webio_t* io = client->_io;
 
   /* Start a write timeout. */
@@ -209,7 +216,7 @@ void webserver_respond(webclient_t* client, char* response, webserver_free_cb fr
 
     if (io->ssl) {
       char*   offset  = response;
-      ssize_t towrite = strlen(response);
+      ssize_t towrite = size;
 
       while (towrite > 0) {
         ERR_clear_error();
@@ -249,7 +256,7 @@ void webserver_respond(webclient_t* client, char* response, webserver_free_cb fr
 
       ++io->write_active;
 
-      uv_buf_t buf = uv_buf_init(response, strlen(response));
+      uv_buf_t buf = uv_buf_init(response, size);
     
       if (uv_write(&w->req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
         free(w);
@@ -271,8 +278,10 @@ void webserver_respond(webclient_t* client, char* response, webserver_free_cb fr
 static int on_message_complete(http_parser *p) {
   webio_t* io = (webio_t*)p->data;
 
+  io->client.version = (p->http_major * 10) + p->http_minor;
+
 #ifdef HAVE_KEEP_ALIVE
-  if (io->keep_alive && http_should_keep_alive(p) && (p->http_major > 0) && (p->http_minor > 0)) {
+  if (io->keep_alive && http_should_keep_alive(p) && (io->client.version > 0)) {
     io->keep_alive = 1;
   }
 #endif
