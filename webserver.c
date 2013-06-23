@@ -119,7 +119,7 @@ static void after_write(uv_write_t* req, int status) {
       /* With http 1.0 client such as ApacheBench we need to close
        * the connection our selves.
        */
-      if ((io->parser.http_major <= 1) || (io->parser.http_minor == 0)) {
+      if (io->client.version <= 10) {
         uv_close((uv_handle_t*)&io->handle, after_close);
       } else {
         /* We prefer the client to disconnect so we don't end up with
@@ -163,9 +163,11 @@ void webserver_respond(webclient_t* client, char* response, size_t size, webserv
 
 static int on_message_complete(http_parser *p) {
   webio_t* io = (webio_t*)p->data;
+  
+  io->client.version = (p->http_major * 10) + p->http_minor;
 
 #ifdef HAVE_KEEP_ALIVE
-  if (io->keep_alive && http_should_keep_alive(p) && (p->http_major > 0) && (p->http_minor > 0)) {
+  if (io->keep_alive && http_should_keep_alive(p) && (io->client.version > 0)) {
     io->keep_alive = 1;
   }
 #endif

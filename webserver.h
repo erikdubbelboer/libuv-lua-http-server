@@ -53,7 +53,8 @@ typedef struct webclient_s {
 
   char url[1024];
 
-  uint8_t method;  /* One of the http_method enum members from http_parser.h */
+  uint8_t method;   /* One of the http_method enum members from http_parser.h */
+  uint8_t version;  /* HTTP version, (major * 10) + minor                     */
 
   char cookie  [1024*2];
   char agent   [1024];
