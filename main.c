@@ -143,11 +143,11 @@ static void on_webserver_handle(webclient_t* web) {
     lua_getglobal(entry->L, "__error__handler");
 
     if (luaL_loadfile(entry->L, entry->file + 1)) {
-      free(entry);
-
       http_error(web, 500, lua_tostring(entry->L, -1));
 
       lua_close(entry->L);
+
+      free(entry);
       return;
     }
 
