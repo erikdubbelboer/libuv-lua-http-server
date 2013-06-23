@@ -358,6 +358,7 @@ int main(int argc, char* argv[]) {
   const char* https_ip       = json_object_dotget_string(config, "https.ip"     );
   int         https_port     = json_object_dotget_number(config, "https.port"   );
   const char* https_pemfile  = json_object_dotget_string(config, "https.pemfile");
+  const char* https_cafile   = json_object_dotget_string(config, "https.cafile" );  /* allowed to be unsed. */
   const char* https_ciphers  = json_object_dotget_string(config, "https.ciphers");
 
   if (!http_ip  || (http_port  <= 0) ||
@@ -397,7 +398,7 @@ int main(int argc, char* argv[]) {
   https_server.handle_cb = on_webserver_handle_https;
   https_server.close_cb  = on_webserver_close;
 
-  if ((err = webserver_start_ssl(&https_server, https_ip, https_port, https_pemfile, https_ciphers)) != 0) {
+  if ((err = webserver_start_ssl(&https_server, https_ip, https_port, https_pemfile, https_cafile, https_ciphers)) != 0) {
     printf("%s\n", webserver_error(&https_server));
     exit(1);
   }

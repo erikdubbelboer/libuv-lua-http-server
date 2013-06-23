@@ -131,6 +131,9 @@ static void after_write(uv_write_t* req, int status) {
 
   if (w->data) {
     free(w->data);
+    w->data = 0;
+  } else {
+    return;
   }
 
   if ((--w->io->write_active == 0) && (w->io->closing)) {
@@ -399,10 +402,16 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
         int r = SSL_accept(io->ssl);
 
         if (r <= 0) {
-          int ssl_error = SSL_get_error(io->ssl, r);
+          int ssl_error  = SSL_get_error(io->ssl, r);
+          int ssl_reason = ERR_GET_REASON(ssl_error);
 
-          if ((ssl_error == SSL_ERROR_WANT_READ) ||
-              (ssl_error == SSL_ERROR_WANT_WRITE)) {
+          /* These are some errors we can just skip. */
+          if ((ssl_error  == SSL_ERROR_WANT_READ) ||
+              (ssl_error  == SSL_ERROR_WANT_WRITE) ||
+              (ssl_reason == SSL_R_TLSV1_ALERT_UNKNOWN_CA) ||
+              (ssl_reason == SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN) ||
+              (ssl_reason == SSL_R_SSLV3_ALERT_BAD_CERTIFICATE) ||
+              (ssl_reason == SSL_R_SSL_HANDSHAKE_FAILURE)) {
             ERR_clear_error();
           } else {
             unsigned long err;
@@ -432,9 +441,15 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
         }
 
         int ssl_error = SSL_get_error(io->ssl, bread);
+        int ssl_reason = ERR_GET_REASON(ssl_error);
 
-        if ((ssl_error == SSL_ERROR_WANT_READ) ||
-            (ssl_error == SSL_ERROR_WANT_WRITE)) {
+        /* These are some errors we can just skip. */
+        if ((ssl_error  == SSL_ERROR_WANT_READ) ||
+            (ssl_error  == SSL_ERROR_WANT_WRITE) ||
+            (ssl_reason == SSL_R_TLSV1_ALERT_UNKNOWN_CA) ||
+            (ssl_reason == SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN) ||
+            (ssl_reason == SSL_R_SSLV3_ALERT_BAD_CERTIFICATE) ||
+            (ssl_reason == SSL_R_SSL_HANDSHAKE_FAILURE)) {
           ERR_clear_error();
         } else {
           unsigned long err;
@@ -627,7 +642,7 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
 }
 
 
-static int start_common_ssl(webserver_t* server, const char* pemfile, const char* ciphers) {
+static int start_common_ssl(webserver_t* server, const char* pemfile, const char* cafile, const char* ciphers) {
   if (!ssl_init) {
     SSL_library_init();
     SSL_load_error_strings();  
@@ -645,6 +660,12 @@ static int start_common_ssl(webserver_t* server, const char* pemfile, const char
 
   if (!server->_ssl) {
     return 1;
+  }
+
+  if (cafile) {
+    if (SSL_CTX_load_verify_locations(server->_ssl, cafile, 0) != 1) {
+      return 1;
+    }
   }
 
   if (SSL_CTX_use_certificate_file(server->_ssl, pemfile, SSL_FILETYPE_PEM) != 1) {
@@ -667,13 +688,13 @@ static int start_common_ssl(webserver_t* server, const char* pemfile, const char
 }
 
 
-int webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* pemfile, const char* ciphers) {
+int webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* pemfile, const char* cafile, const char* ciphers) {
   assert(server->handle_cb);
   assert(server->close_cb );
 
   start_common(server);
 
-  if (start_common_ssl(server, pemfile, ciphers) != 0) {
+  if (start_common_ssl(server, pemfile, cafile, ciphers) != 0) {
     return 1;
   }
 
