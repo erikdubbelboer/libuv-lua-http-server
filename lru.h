@@ -100,6 +100,9 @@ attr void type##_lru_move_head(                                  \
                                                                  \
       entry->field.prev = lru->list->field.prev;                 \
       entry->field.next = lru->list;                             \
+                                                                 \
+      entry->field.next->field.prev = entry;                     \
+      entry->field.prev->field.next = entry;                     \
     }                                                            \
                                                                  \
     lru->list = entry;                                           \

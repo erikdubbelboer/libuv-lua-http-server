@@ -20,4 +20,5 @@ cat certificate.crt >> ssl.pem
 TODO:
 ----
 * Custom script not found or could not parse handler that could be used to serve static content.
+* [SPDY v3](http://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3)
 

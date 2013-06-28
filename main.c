@@ -62,6 +62,9 @@ static void lru_free(lru_entry_t* entry) {
 LRU_TYPE(lru_entry_s) scriptlru;
 
 LRU_GENERATE_STATIC(lru_entry_s, lru_compare, lru_free, lru)
+
+static webserver_t server_http;
+static webserver_t server_https;
     
 
 char* lua_error_handler = 
@@ -100,7 +103,17 @@ static void http_error(webclient_t* web, int status, const char* message) {
   /* There will always be enough room for this. */
   strcat(buffer, message);
 
-  webserver_respond(web, buffer, n + size, free);
+  webserver_respond(web, buffer, n + size, free, 0);
+}
+
+
+static int clua_shutdown(lua_State* L) {
+  (void)L;
+
+  webserver_stop(&server_http);
+  webserver_stop(&server_https);
+
+  return 0;
 }
 
 
@@ -147,39 +160,52 @@ static void on_webserver_handle(webclient_t* web, int https) {
 
       lua_close(entry->L);
 
+      free(entry->file);
       free(entry);
       return;
     }
 
+    lua_pushcfunction(entry->L, clua_shutdown);
+    lua_setglobal(entry->L, "shutdown");
+
     LRU_INSERT(lru_entry_s, &scriptlru, entry);
   }
+
+
+  /* The stack should be of size 2 with the
+   * 1e item __error__handler and the
+   * 2e item the script loaded by luaL_loadfile.
+   */
+  assert(lua_gettop(entry->L) == 2);
+  assert(lua_isfunction(entry->L, 1));
+  assert(lua_isfunction(entry->L, 2));
 
 
   /* Push the request table on the stack. */
   lua_createtable(entry->L, 0, 6);
 
   /* Fill it. */
-  lua_pushstring(entry->L, "ip");
-  lua_pushnumber(entry->L, web->ip);
-  lua_rawset    (entry->L, -3);
-  lua_pushstring(entry->L, "url");
-  lua_pushstring(entry->L, web->url);
-  lua_rawset    (entry->L, -3);
-  lua_pushstring(entry->L, "method");
-  lua_pushstring(entry->L, http_method_str(web->method));
-  lua_rawset    (entry->L, -3);
-  lua_pushstring(entry->L, "https");
-  lua_pushnumber(entry->L, https);
-  lua_rawset    (entry->L, -3);
-  lua_pushstring(entry->L, "cookie");
-  lua_pushstring(entry->L, web->cookie);
-  lua_rawset    (entry->L, -3);
-  lua_pushstring(entry->L, "agent");
-  lua_pushstring(entry->L, web->agent);
-  lua_rawset    (entry->L, -3);
-  lua_pushstring(entry->L, "referrer");
-  lua_pushstring(entry->L, web->referrer);
-  lua_rawset    (entry->L, -3);
+  lua_pushliteral(entry->L, "ip");
+  lua_pushnumber (entry->L, web->ip);
+  lua_rawset     (entry->L, -3);
+  lua_pushliteral(entry->L, "url");
+  lua_pushstring (entry->L, web->url);
+  lua_rawset     (entry->L, -3);
+  lua_pushliteral(entry->L, "method");
+  lua_pushstring (entry->L, http_method_str(web->method));
+  lua_rawset     (entry->L, -3);
+  lua_pushliteral(entry->L, "https");
+  lua_pushnumber (entry->L, https);
+  lua_rawset     (entry->L, -3);
+  lua_pushliteral(entry->L, "cookie");
+  lua_pushstring (entry->L, web->cookie);
+  lua_rawset     (entry->L, -3);
+  lua_pushliteral(entry->L, "agent");
+  lua_pushstring (entry->L, web->agent);
+  lua_rawset     (entry->L, -3);
+  lua_pushliteral(entry->L, "referrer");
+  lua_pushstring (entry->L, web->referrer);
+  lua_rawset     (entry->L, -3);
 
   /* Assign it to a global variable. */
   lua_setglobal(entry->L, "request");
@@ -188,35 +214,37 @@ static void on_webserver_handle(webclient_t* web, int https) {
   /* Push the response table on the stack. */
   lua_createtable(entry->L, 0, 6);
   
-  lua_pushstring(entry->L, "headers");
+  lua_pushliteral(entry->L, "headers");
 
   /* Push the headers table on the stack. */
   lua_createtable(entry->L, 0, 6);
   
-  lua_pushstring(entry->L, "Content-Type");
-  lua_pushstring(entry->L, "text/html");
-  lua_rawset    (entry->L, -3);
+  lua_pushliteral(entry->L, "Content-Type");
+  lua_pushliteral(entry->L, "text/html");
+  lua_rawset     (entry->L, -3);
 
   /* Assign it to the headers field. */
   lua_rawset    (entry->L, -3);
   
-  lua_pushstring(entry->L, "body");
-  lua_pushstring(entry->L, "");
-  lua_rawset    (entry->L, -3);
-  lua_pushstring(entry->L, "status");
-  lua_pushnumber(entry->L, 200);
-  lua_rawset    (entry->L, -3);
+  lua_pushliteral(entry->L, "body");
+  lua_pushliteral(entry->L, "");
+  lua_rawset     (entry->L, -3);
+  lua_pushliteral(entry->L, "status");
+  lua_pushnumber (entry->L, 200);
+  lua_rawset     (entry->L, -3);
 
   /* Assign it to a global variable. */
   lua_setglobal(entry->L, "response");
 
 
-  /* Push the main script function on the stack.
-   * (the on pushed by luaL_loadfile).
+  /* Duplicate the main script function on the stack.
+   * (the one pushed by luaL_loadfile).
+   * We need to do this because lua_pcall replaces the
+   * function with the return value.
    */
-  lua_pushvalue(entry->L, -1);
+  lua_pushvalue(entry->L, 2);
 
-  if (lua_pcall(entry->L, 0, 1, -2)) {
+  if (lua_pcall(entry->L, 0, 0, 1)) {
     http_error(web, 500, lua_tostring(entry->L, -1));
   
     /* Return the stack to the starting state. */
@@ -235,7 +263,7 @@ static void on_webserver_handle(webclient_t* web, int https) {
   }
 
   /* The the body. */
-  lua_pushstring(entry->L, "body");
+  lua_pushliteral(entry->L, "body");
   lua_gettable(entry->L, -2);
 
   if (!lua_isstring(entry->L, -1)) {
@@ -254,7 +282,7 @@ static void on_webserver_handle(webclient_t* web, int https) {
   
   
   /* Get the status code. */
-  lua_pushstring(entry->L, "status");
+  lua_pushliteral(entry->L, "status");
   lua_gettable(entry->L, -2);
 
   if (!lua_isnumber(entry->L, -1)) {
@@ -273,7 +301,7 @@ static void on_webserver_handle(webclient_t* web, int https) {
 
   sds headers = sdsempty();
 
-  lua_pushstring(entry->L, "headers");
+  lua_pushliteral(entry->L, "headers");
   lua_gettable(entry->L, -2);
   
   /* Push the first key. */
@@ -318,7 +346,7 @@ static void on_webserver_handle(webclient_t* web, int https) {
 
   response = sdscatlen(response, body, body_size);
 
-  webserver_respond(web, response, sdslen(response), (webserver_free_cb)sdsfree);
+  webserver_respond(web, response, sdslen(response), (webserver_free_cb)sdsfree, 0);
 
   /* Return the stack to the starting state. */
   lua_pop(entry->L, lua_gettop(entry->L) - 2);
@@ -340,26 +368,31 @@ static void on_webserver_close(webclient_t* web) {
 }
 
 
+static void on_webserver_error(const char* error) {
+  puts(error);
+}
+
+
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     printf("missing config file\n");
     exit(1);
   }
 
-  JSON_Object* config = json_value_get_object(json_parse_file(argv[1]));
+  JSON_Value*  config_value = json_parse_file(argv[1]);
+  JSON_Object* config       = json_value_get_object(config_value);
 
   if (!config) {
     printf("could not load config file\n");
     exit(1);
   }
   
-  const char* http_ip        = json_object_dotget_string(config, "http.ip"      );
-  int         http_port      = json_object_dotget_number(config, "http.port"    );
-  const char* https_ip       = json_object_dotget_string(config, "https.ip"     );
-  int         https_port     = json_object_dotget_number(config, "https.port"   );
-  const char* https_pemfile  = json_object_dotget_string(config, "https.pemfile");
-  const char* https_cafile   = json_object_dotget_string(config, "https.cafile" );  /* allowed to be unsed. */
-  const char* https_ciphers  = json_object_dotget_string(config, "https.ciphers");
+  const char* http_ip       = json_object_dotget_string(config, "http.ip"      );
+  int         http_port     = json_object_dotget_number(config, "http.port"    );
+  const char* https_ip      = json_object_dotget_string(config, "https.ip"     );
+  int         https_port    = json_object_dotget_number(config, "https.port"   );
+  const char* https_pemfile = json_object_dotget_string(config, "https.pemfile");
+  const char* https_ciphers = json_object_dotget_string(config, "https.ciphers");
 
   if (!http_ip  || (http_port  <= 0) ||
       !https_ip || (https_port <= 0) ||
@@ -376,35 +409,56 @@ int main(int argc, char* argv[]) {
     cachesize = 64;
   }
 
+
+  struct sigaction sa;
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = SIG_IGN;
+  sigfillset(&sa.sa_mask);
+  sigaction(SIGPIPE, &sa, 0);
+
+
   LRU_INIT(&scriptlru, cachesize);
 
 
   uv_loop_t* loop = uv_default_loop();
+  int        err;
 
 
-  webserver_t http_server;
-
-  http_server.loop      = loop;
-  http_server.handle_cb = on_webserver_handle_http;
-  http_server.close_cb  = on_webserver_close;
+  server_http.loop      = loop;
+  server_http.handle_cb = on_webserver_handle_http;
+  server_http.close_cb  = on_webserver_close;
+  server_http.error_cb  = 0;
   
-  UV_CHECK(webserver_start(&http_server, http_ip, http_port));
+  if ((err = webserver_start(&server_http, http_ip, http_port)) != 0) {
+    printf("%s\n", webserver_error(&server_https));
+    exit(1);
+  }
 
 
-  webserver_t https_server;
-  int         err;
+  server_https.loop      = loop;
+  server_https.handle_cb = on_webserver_handle_https;
+  server_https.close_cb  = on_webserver_close;
+  server_https.error_cb  = on_webserver_error;
 
-  https_server.loop      = loop;
-  https_server.handle_cb = on_webserver_handle_https;
-  https_server.close_cb  = on_webserver_close;
-
-  if ((err = webserver_start_ssl(&https_server, https_ip, https_port, https_pemfile, https_cafile, https_ciphers)) != 0) {
-    printf("%s\n", webserver_error(&https_server));
+  if ((err = webserver_start_ssl(&server_https, https_ip, https_port, https_pemfile, https_ciphers)) != 0) {
+    printf("%s\n", webserver_error(&server_https));
     exit(1);
   }
 
 
   uv_run(loop, UV_RUN_DEFAULT);
+
+
+  /* Clean up the lru cache. */
+  lru_entry_t* p;
+  while ((p = LRU_HEAD(&scriptlru))) {
+    LRU_REMOVE(lru_entry_s, &scriptlru, p);
+  }
+
+
+  json_value_free(config_value);
+
 
   return 0;
 }

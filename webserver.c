@@ -42,20 +42,16 @@ typedef struct webio_s {
     uv_tcp_t  tcp;
   } handle;
 
-  SSL* ssl;
-  BIO* ssl_write;
-  BIO* ssl_read;
-
-  webserver_t* server;
+  SSL*      ssl;
+  uv_poll_t ssl_poll;
 
   http_parser parser;
   uv_timer_t  timeout;
   
+  uv_write_t        write_req;
   char*             write_data;
-  int               write_active;
+  size_t            write_size;
   webserver_free_cb write_free;
-
-  int closing;
 
 #ifdef HAVE_KEEP_ALIVE
   int keep_alive;
@@ -68,22 +64,38 @@ typedef struct webio_s {
 } webio_t;
 
 
-typedef struct webwrite_s {
-  webio_t*   io;
-  char*      data;
-  uv_write_t req;
-} webwrite_t;
-
-
-static void flush_write_bio(webio_t* io);
+static void on_poll(uv_poll_t* handle, int status, int events);
 
 
 static http_parser_settings parser_settings;
 static int                  ssl_init = 0;
 
 
+static void shutdown_ssl(webserver_t* server) {
+  /* This will cleanup almost everything.
+   * There are some things in OpenSSL that we just can't clean.
+   */
+
+  SSL_CTX_free(server->_ssl);
+
+  ERR_remove_state(0);
+
+  ERR_free_strings();
+  EVP_cleanup();
+  CRYPTO_cleanup_all_ex_data();
+
+  ssl_init = 0;
+}
+
+
 static void after_close_timeout(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
+
+  if ( io->client.server->_ssl     &&
+       io->client.server->_closing &&
+      (io->client.server->connected == 0)) {
+    shutdown_ssl(io->client.server);
+  }
 
   free(io);
 }
@@ -92,17 +104,55 @@ static void after_close_timeout(uv_handle_t* handle) {
 static void after_close(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
 
-  --io->server->connected;
+  --io->client.server->connected;
 
-  SSL_free(io->ssl);
-  ERR_clear_error();
+  assert(io->client.server->connected >= 0);
+  
+  if (io->write_data) {
+    io->write_free(io->write_data);
+    io->write_data = 0;
+  }
 
-  io->server->close_cb(&io->client);
+  if (io->ssl) {
+    SSL_free(io->ssl);
+  }
+
+  io->client.server->close_cb(&io->client);
 
   /* We can't just free the io here, we need to close the timer first.
    * (even when it's not active anymore).
    */
   uv_close((uv_handle_t*)&io->timeout, after_close_timeout);
+}
+
+
+static void after_close_poll(uv_handle_t* handle) {
+  webio_t* io = (webio_t*)handle->data;
+  
+  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+    uv_close((uv_handle_t*)&io->handle, after_close);
+  }
+}
+
+
+static void do_close(webio_t* io) {
+  uv_timer_stop(&io->timeout);
+
+  if (io->ssl) {
+    SSL_shutdown(io->ssl);
+
+    /* This is a bit hacky but otherwise we would need a new variable
+     * to indicate if poll_init has been called.
+     */
+    if (io->ssl_poll.data) {
+      uv_close((uv_handle_t*)&io->ssl_poll, after_close_poll);
+      return;
+    }
+  }
+
+  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+    uv_close((uv_handle_t*)&io->handle, after_close);
+  }
 }
 
 
@@ -114,14 +164,12 @@ static void on_timeout(uv_timer_t* handle, int status) {
   assert(status == 0);
   (void)status;  /* For release builds. */
 
-  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-    uv_close((uv_handle_t*)&io->handle, after_close);
-  }
+  do_close(io);
 }
 
 
 static void after_write(uv_write_t* req, int status) {
-  webwrite_t* w = (webwrite_t*)req->data;
+  webio_t* io = (webio_t*)req->data;
 
   /* status will be set to UV_ECANCELED when the connection
    * is closed durint the write.
@@ -129,151 +177,194 @@ static void after_write(uv_write_t* req, int status) {
   assert((status == 0) || (status != UV_ECANCELED));
   (void)status;  /* For release builds. */
 
-  if (w->data) {
-    free(w->data);
-    w->data = 0;
+  if (io->write_data) {
+    io->write_free(io->write_data);
+    io->write_data = 0;
   } else {
     return;
   }
 
-  if ((--w->io->write_active == 0) && (w->io->closing)) {
-    if (w->io->write_free) {
-      w->io->write_free(w->io->write_data);
-      w->io->write_free = 0;
+  /* Stop the write timeout. */
+  uv_timer_stop(&io->timeout);
+
+  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+    if (io->client.server->_closing) {
+      do_close(io);
     }
-
-    /* Stop the write timeout. */
-    uv_timer_stop(&w->io->timeout);
-
-    if (!uv_is_closing((uv_handle_t*)req->handle)) {
 #ifdef HAVE_KEEP_ALIVE
-      if (!w->io->keep_alive) {
+    else if (io->keep_alive) {
+      uv_timer_start(&io->timeout, on_timeout, WEBSERVER_KEEPALIVE_TIMEOUT, 0);
+    }
 #endif
-        /* With http 1.0 client such as ApacheBench we need to close
-         * the connection our selves.
-         */
-        if (w->io->client.version <= 10) {
-          uv_close((uv_handle_t*)&w->io->handle, after_close);
-        } else {
-          /* We prefer the client to disconnect so we don't end up with
-           * to many socket in the TIME_WAIT state. So set a timeout
-           * after which we close the socket.
-           */
-          uv_timer_start(&w->io->timeout, on_timeout, 1000, 0);
-        }
-#ifdef HAVE_KEEP_ALIVE
+    else {
+      /* With http 1.0 client such as ApacheBench we need to close
+       * the connection our selves.
+       */
+      if (io->client.version <= 10) {
+        do_close(io);
       } else {
-        w->io->closing = 0;
-
-        uv_timer_start(&w->io->timeout, on_timeout, w->io->server->keepalive_timeout, 0);
+        /* We prefer the client to disconnect so we don't end up with
+         * to many socket in the TIME_WAIT state. So set a timeout
+         * after which we close the socket.
+         */
+        uv_timer_start(&io->timeout, on_timeout, 5000, 0);
       }
+    }
+  }
+}
+
+
+static const char* ssl_get_state(SSL* ssl) {
+  return (SSL_is_init_finished(ssl) ? "init finished" :
+         (SSL_in_init(ssl)          ? "init"          :
+         (SSL_in_before(ssl)        ? "before"        :
+         (SSL_in_accept_init(ssl)   ? "accept"        :
+                                      "unknown"
+         ))));
+}
+
+
+static void handle_ssl_error(webio_t* io, const char* what, ssize_t n) {
+  char buffer[512];
+  int  ssl_error = SSL_get_error(io->ssl, n);
+
+  if (ssl_error == SSL_ERROR_WANT_WRITE) {
+    uv_poll_start(&io->ssl_poll, UV_READABLE | UV_WRITABLE, on_poll);
+  } else if (ssl_error == SSL_ERROR_WANT_READ) {
+    /* We are always listening for read events so we can ignore this. */
+  } else {
+    if ((ssl_error != SSL_ERROR_ZERO_RETURN) && io->client.server->error_cb) {
+      /*
+       * man SSL_get_error()
+       *
+       * SSL_ERROR_SYSCALL
+       *   Some I/O error occurred.  The OpenSSL error queue may contain more
+       *   information on the error.  If the error queue is empty (i.e.
+       *   ERR_get_error() returns 0), ret can be used to find out more about
+       *   the error: If ret == 0, an EOF was observed that violates the
+       *   protocol.  If ret == -1, the underlying BIO reported an I/O error
+       *   (for socket I/O on Unix systems, consult errno for details).
+       *
+       */
+      unsigned long err = ERR_get_error();
+
+      if (err) {
+        do {
+#define WEBSERVER_VERBOSE
+#ifndef WEBSERVER_VERBOSE
+          int reason = ERR_GET_REASON(err);
+
+          /* Ignore some common errors that we can do nothing about.
+           * and can ignore in almost all instances.
+           *
+           * TODO: why are we getting SSL_R_TLSV1_ALERT_UNKNOWN_CA when we tell
+           * OpenSSL not to check for client certificates (SSL_VERIFY_NONE)?
+           */
+          if ((reason != SSL_R_SSL_HANDSHAKE_FAILURE          ) &&
+              /* Clients that don't know our intermediate ca? */
+              (reason != SSL_R_TLSV1_ALERT_UNKNOWN_CA         ) &&
+              (reason != SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN) &&
+              /* Are these clients that have their time set incorrectly? */
+              (reason != SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED) &&
+              (reason != SSL_R_SSLV3_ALERT_BAD_CERTIFICATE    )) {
 #endif
-    }
-  }
-
-  free(w);
-}
-
-
-static void flush_write_bio(webio_t* io) {
-  char buffer[1024 * 4];
-  int  bread;
-
-  while ((bread = BIO_read(io->ssl_write, buffer, sizeof(buffer))) > 0) {
-    webwrite_t* w = malloc(sizeof(*w));
-
-    w->io   = io;
-    w->data = malloc(bread);
-    memcpy(w->data, buffer, bread);
-
-    w->req.data = w;
-
-    uv_buf_t buf = uv_buf_init(w->data, bread);
-  
-    if (uv_write(&w->req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
-      free(w);
-      free(w->data);
-
-      if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-        uv_close((uv_handle_t*)&io->handle, after_close);
+            snprintf(buffer, sizeof(buffer), "SSL_%s() = %zd, SSL_get_state() = %s, SSL_get_error() = %d, msg = %s", what, n, ssl_get_state(io->ssl), ssl_error, ERR_error_string(err, 0));
+            io->client.server->error_cb(buffer);
+#ifndef WEBSERVER_VERBOSE
+          }
+#endif
+        } while ((err = ERR_get_error()));
       }
+
+      if ((ssl_error == SSL_ERROR_SYSCALL) && (n != 0)) {
+        if ((errno != EPIPE) && (errno != ECONNRESET)) {
+          snprintf(buffer, sizeof(buffer), "SSL_%s() = %zd, SSL_get_state() = %s, SSL_get_error() = %d, errno = %s", what, n, ssl_get_state(io->ssl), ssl_error, strerror(errno));
+          io->client.server->error_cb(buffer);
+        }
+      } else {
+        /* This is not actually and error, this just means we have to tell libuv to close the socket. */
+      }
+    }
+
+    do_close(io);
+  }
+}
+
+
+static void on_poll(uv_poll_t* handle, int status, int events) {
+  (void)status;
+
+  webio_t* io = (webio_t*)handle->data;
+  ssize_t  n;
+
+  ERR_clear_error();
+
+  if (events & UV_READABLE) {
+    char buffer[1024 * 4];
+
+    while ((n = SSL_read(io->ssl, buffer, sizeof(buffer))) > 0) {
+      ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buffer, n);
+
+      if (parsed < n) {
+        if (io->client.server->error_cb) {
+          char buffer[512];
+
+          snprintf(buffer, sizeof(buffer), "http_parser_execute() = %zd, SSL_read() = %zd\n", parsed, n);
+          io->client.server->error_cb(buffer);
+        }
+
+        do_close(io);
+        break;
+      }
+    }
+
+    if (n <= 0) {
+      handle_ssl_error(io, "read", n);
+      return;
+    }
+  }
+
+  if ((events & UV_WRITABLE) && io->write_data) {
+    n = SSL_write(io->ssl, io->write_data, io->write_size);
+
+    if (n != (ssize_t)io->write_size) {
+      handle_ssl_error(io, "write", n);
     } else {
-      ++io->write_active;
+      /* Go back to just reading. */
+      uv_poll_start(&io->ssl_poll, UV_READABLE, on_poll);
+
+      after_write(&io->write_req, 0);
     }
   }
 }
 
 
-
-void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb) {
+void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout) {
   webio_t* io = client->_io;
 
   /* Start a write timeout. */
-  uv_timer_start(&io->timeout, on_timeout, io->server->write_timeout, 0);
+  uv_timer_start(&io->timeout, on_timeout, timeout ? timeout : WEBSERVER_WRITE_TIMEOUT, 0);
 
   if (response) {
     io->write_data = response;
+    io->write_size = size;
     io->write_free = free_cb;
 
-    io->closing = 1;
-
     if (io->ssl) {
-      char*   offset  = response;
-      ssize_t towrite = size;
-
-      while (towrite > 0) {
-        ERR_clear_error();
-        ssize_t r = SSL_write(io->ssl, offset, towrite);
-
-        if (r <= 0) {
-          int ssl_error = SSL_get_error(io->ssl, r);
-
-          if (ssl_error == SSL_ERROR_WANT_WRITE) {
-            flush_write_bio(io);
-          } else {
-            unsigned long err;
-           
-            while ((err = ERR_get_error())) {
-              printf("SSL_write(): SSL_get_error() = %d, SSL_write() = %zd msg = %s\n", ssl_error, r, ERR_error_string(err, 0));
-            }
-        
-            free_cb(response);
-    
-            if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-              uv_close((uv_handle_t*)&io->handle, after_close);
-            }
-          }
-        } else {
-          towrite -= r;
-          offset  += r;
-        }
-      }
-            
-      flush_write_bio(io);
+      uv_poll_start(&io->ssl_poll, UV_READABLE | UV_WRITABLE, on_poll);
     } else {
-      webwrite_t* w = malloc(sizeof(*w));
-
-      w->io       = io;
-      w->data     = 0;
-      w->req.data = w;
-
-      ++io->write_active;
-
       uv_buf_t buf = uv_buf_init(response, size);
     
-      if (uv_write(&w->req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
-        free(w);
+      if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
         free_cb(response);
 
-        if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-          uv_close((uv_handle_t*)&io->handle, after_close);
-        }
+        do_close(io);
       }
     }
   } else {
-    if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-      uv_close((uv_handle_t*)&io->handle, after_close);
-    }
+    free_cb(response);
+
+    do_close(io);
   }
 }
 
@@ -291,7 +382,7 @@ static int on_message_complete(http_parser *p) {
 
   uv_timer_stop(&io->timeout);
 
-  io->server->handle_cb(&io->client);
+  io->client.server->handle_cb(&io->client);
 
   return 0;
 }
@@ -370,7 +461,6 @@ static int on_message_begin(http_parser *p) {
   /* If uv_tcp_getpeername() returns an error the IP will just be set to 0. */
   uv_tcp_getpeername((uv_tcp_t*)&io->handle, (struct sockaddr*)&sockname, &namelen);
 
-  io->client.ip          = sockname.sin_addr.s_addr;
   io->client.method      = p->method;
   io->client.url[0]      = 0;
   io->client.cookie[0]   = 0;
@@ -385,7 +475,7 @@ static int on_message_begin(http_parser *p) {
    * This will automatically stop the timer that might be running
    * if this is a keep-alive connection.
    */
-  uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+  uv_timer_start(&io->timeout, on_timeout, WEBSERVER_READ_TIMEOUT, 0);
   
   return 0;
 }
@@ -395,81 +485,20 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
   webio_t* io = (webio_t*)tcp->data;
 
   if (nread >= 0) {
-    if (io->ssl) {
-      assert(BIO_write(io->ssl_read, buf.base, nread)  == nread);
+    ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buf.base, nread);
 
-      if (!SSL_is_init_finished(io->ssl)) {
-        int r = SSL_accept(io->ssl);
+    if (parsed < nread) {
+      if (io->client.server->error_cb) {
+        char buffer[512];
 
-        if (r <= 0) {
-          int ssl_error  = SSL_get_error(io->ssl, r);
-          int ssl_reason = ERR_GET_REASON(ssl_error);
-
-          /* These are some errors we can just skip. */
-          if ((ssl_error  == SSL_ERROR_WANT_READ) ||
-              (ssl_error  == SSL_ERROR_WANT_WRITE) ||
-              (ssl_reason == SSL_R_TLSV1_ALERT_UNKNOWN_CA) ||
-              (ssl_reason == SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN) ||
-              (ssl_reason == SSL_R_SSLV3_ALERT_BAD_CERTIFICATE) ||
-              (ssl_reason == SSL_R_SSL_HANDSHAKE_FAILURE)) {
-            ERR_clear_error();
-          } else {
-            unsigned long err;
-
-            while ((err = ERR_get_error())) {
-              printf("SSL_accept(): SSL_get_error() = %d, SSL_accept() = %d msg = %s\n", ssl_error, r, ERR_error_string(err, 0));
-            }
-        
-            uv_close((uv_handle_t*)&io->handle, after_close);
-          }
-        }
-            
-        flush_write_bio(io);
+        snprintf(buffer, sizeof(buffer), "http_parser_execute() = %zd, on_read = %zd\n", parsed, nread);
+        io->client.server->error_cb(buffer);
       }
 
-      if (SSL_is_init_finished(io->ssl)) {
-        char    buffer[1024 * 4];
-        ssize_t bread;
-
-        while ((bread = SSL_read(io->ssl, buffer, sizeof(buffer))) > 0) {
-          ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buffer, bread);
-
-          if (parsed < bread) {
-            uv_close((uv_handle_t*)&io->handle, after_close);
-            break;
-          }
-        }
-
-        int ssl_error = SSL_get_error(io->ssl, bread);
-        int ssl_reason = ERR_GET_REASON(ssl_error);
-
-        /* These are some errors we can just skip. */
-        if ((ssl_error  == SSL_ERROR_WANT_READ) ||
-            (ssl_error  == SSL_ERROR_WANT_WRITE) ||
-            (ssl_reason == SSL_R_TLSV1_ALERT_UNKNOWN_CA) ||
-            (ssl_reason == SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN) ||
-            (ssl_reason == SSL_R_SSLV3_ALERT_BAD_CERTIFICATE) ||
-            (ssl_reason == SSL_R_SSL_HANDSHAKE_FAILURE)) {
-          ERR_clear_error();
-        } else {
-          unsigned long err;
-
-          while ((err = ERR_get_error())) {
-            printf("SSL_read(): SSL_get_error() = %d, SSL_read() = %zd msg = %s\n", ssl_error, bread, ERR_error_string(err, 0));
-          }
-      
-          uv_close((uv_handle_t*)&io->handle, after_close);
-        }
-      }
-    } else {
-      ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buf.base, nread);
-
-      if (parsed < nread) {
-        uv_close((uv_handle_t*)&io->handle, after_close);
-      }
+      do_close(io);
     }
   } else {
-    uv_close((uv_handle_t*)&io->handle, after_close);
+    do_close(io);
   }
 
   free(buf.base);
@@ -485,37 +514,58 @@ static uv_buf_t on_alloc(uv_handle_t* handle, size_t suggested_size) {
   
 
 static void accept_connection(uv_stream_t* handle, webio_t* io) {
+  ++io->client.server->connected;
+
   if (uv_accept(handle, (uv_stream_t*)&io->handle)) {
-    uv_close((uv_handle_t*)&io->handle, after_close);
+    do_close(io);
   } else {
-    uv_timer_init(io->server->loop, &io->timeout);
-    uv_timer_start(&io->timeout, on_timeout, io->server->read_timeout, 0);
+    uv_timer_init(io->client.server->loop, &io->timeout);
+    uv_timer_start(&io->timeout, on_timeout, WEBSERVER_READ_TIMEOUT, 0);
 
     http_parser_init(&io->parser, HTTP_REQUEST);
 
-    io->parser.data  = io;
-    io->timeout.data = io;
-    io->client._io   = io;
+    io->parser.data    = io;
+    io->timeout.data   = io;
+    io->client._io     = io;
+    io->write_req.data = io;
+      
+    struct sockaddr_in sockname;
+    int                namelen = sizeof(sockname);
 
-    if (io->server->_ssl) {
-      io->ssl       = SSL_new(io->server->_ssl);
+    memset(&sockname, 0, sizeof(sockname));
 
+    /* If uv_tcp_getpeername() returns an error the IP will just be set to 0. */
+    uv_tcp_getpeername((uv_tcp_t*)&io->handle, (struct sockaddr*)&sockname, &namelen);
+
+    io->client.ip = sockname.sin_addr.s_addr;
+
+    if (io->client.server->_ssl) {
+      io->ssl = SSL_new(io->client.server->_ssl);
+      
+      assert(io->ssl);
+  
       if (!io->ssl) {
         uv_close((uv_handle_t*)&io->handle, after_close);
         return;
       }
 
-      io->ssl_write = BIO_new(BIO_s_mem());
-      io->ssl_read  = BIO_new(BIO_s_mem());
+      int fd = io->handle.tcp.io_watcher.fd;
 
-      SSL_set_bio(io->ssl, io->ssl_read, io->ssl_write);
+      SSL_set_fd(io->ssl, fd);
       SSL_set_accept_state(io->ssl);
-    }
 
-    if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
-      uv_close((uv_handle_t*)&io->handle, after_close);
-    } else {
-      ++io->server->connected;
+      if (uv_poll_init(io->client.server->loop, &io->ssl_poll, fd) != 0) {
+        /* uv_poll_init() can't fail in the current version of libuv. */
+        assert(0);
+
+        do_close(io);
+      } else {
+        io->ssl_poll.data = io;
+
+        uv_poll_start(&io->ssl_poll, UV_READABLE, on_poll);
+      }
+    } else if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
+      do_close(io);
     }
   }
 }
@@ -532,7 +582,7 @@ static void on_tcp_connection(uv_stream_t* handle, int status) {
 
   uv_tcp_init(server->loop, &io->handle.tcp);
 
-  io->server          = server;
+  io->client.server   = server;
   io->handle.tcp.data = io;
 
   accept_connection(handle, io);
@@ -557,14 +607,14 @@ static void on_pipe_connection(uv_pipe_t *handle, ssize_t nread, uv_buf_t buf, u
 
   uv_pipe_init(server->loop, &io->handle.pipe, 0);
 
-  io->server          = server;
+  io->client.server    = server;
   io->handle.pipe.data = io;
 
   accept_connection((uv_stream_t*)handle, io);
 }
 
 
-static void start_common(webserver_t* server) {
+static void start_common() {
   /* It doesn't matter if this happens more then once when starting multiple webservers.
    * No internal state or anything is stored so it will always set the struct to the same state.
    */
@@ -576,27 +626,15 @@ static void start_common(webserver_t* server) {
   parser_settings.on_header_field     = on_header_field;
   parser_settings.on_url              = on_url;
   parser_settings.on_message_begin    = on_message_begin;
-
-
-  if (!server->read_timeout) {
-    server->read_timeout = WEBSERVER_READ_TIMEOUT;
-  }
-  if (!server->write_timeout) {
-    server->write_timeout = WEBSERVER_WRITE_TIMEOUT;
-  }
-#ifdef HAVE_KEEP_ALIVE
-  if (!server->keepalive_timeout) {
-    server->keepalive_timeout = WEBSERVER_KEEPALIVE_TIMEOUT;
-  }
-#endif
 }
 
 
 int webserver_start(webserver_t* server, const char* ip, int port) {
+  assert(server->loop);
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common(server);
+  start_common();
 
   server->connected = 0;
   server->_ssl      = 0;
@@ -623,10 +661,11 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
 
 
 int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
+  assert(server->loop);
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common(server);
+  start_common();
 
   server->connected = 0;
   server->_ssl      = 0;
@@ -642,31 +681,48 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
 }
 
 
-static int start_common_ssl(webserver_t* server, const char* pemfile, const char* cafile, const char* ciphers) {
+static int start_common_ssl(webserver_t* server, const char* pemfile, const char* ciphers) {
+  start_common();
+
   if (!ssl_init) {
     SSL_library_init();
-    SSL_load_error_strings();  
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
 
     ssl_init = 1;
   }
 
   server->_ssl = SSL_CTX_new(SSLv23_server_method());
 
+  /* Always disable SSLv2, as per RFC 6176. */
   if (!(SSL_OP_NO_SSLv2 & SSL_CTX_set_options(server->_ssl, SSL_OP_NO_SSLv2))) {
+    return 1;
+  }
+
+  /* Turn off compression.
+   * See: http://en.wikipedia.org/wiki/CRIME_%28security_exploit%29
+   */
+  if (!(SSL_OP_NO_COMPRESSION & SSL_CTX_set_options(server->_ssl, SSL_OP_NO_COMPRESSION))) {
+    return 1;
+  }
+
+  if (!(SSL_OP_CIPHER_SERVER_PREFERENCE & SSL_CTX_set_options(server->_ssl, SSL_OP_CIPHER_SERVER_PREFERENCE))) {
     return 1;
   }
 
   SSL_CTX_set_session_cache_mode(server->_ssl, SSL_SESS_CACHE_OFF);
 
+  /* Tell OpenSSL to limit it's memory usage. This is useful for servers with lots
+   * of connections as it can "can save around 34k per idle SSL connection".
+   */
+  SSL_CTX_set_mode(server->_ssl, SSL_MODE_RELEASE_BUFFERS);
+
   if (!server->_ssl) {
     return 1;
   }
 
-  if (cafile) {
-    if (SSL_CTX_load_verify_locations(server->_ssl, cafile, 0) != 1) {
-      return 1;
-    }
-  }
+  /* We don't want the client to send us a client certificate. */
+  SSL_CTX_set_verify(server->_ssl, SSL_VERIFY_NONE, 0);
 
   if (SSL_CTX_use_certificate_file(server->_ssl, pemfile, SSL_FILETYPE_PEM) != 1) {
     return 1;
@@ -688,13 +744,12 @@ static int start_common_ssl(webserver_t* server, const char* pemfile, const char
 }
 
 
-int webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* pemfile, const char* cafile, const char* ciphers) {
+int webserver_start_ssl(webserver_t* server, const char* ip, int port, const char* pemfile, const char* ciphers) {
+  assert(server->loop);
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common(server);
-
-  if (start_common_ssl(server, pemfile, cafile, ciphers) != 0) {
+  if (start_common_ssl(server, pemfile, ciphers) != 0) {
     return 1;
   }
 
@@ -721,12 +776,36 @@ int webserver_start_ssl(webserver_t* server, const char* ip, int port, const cha
 }
 
 
+int webserver_start_ssl2(webserver_t* server, uv_pipe_t* pipe, const char* pemfile, const char* ciphers) {
+  assert(server->loop);
+  assert(server->handle_cb);
+  assert(server->close_cb );
+
+  if (start_common_ssl(server, pemfile, ciphers) != 0) {
+    return 1;
+  }
+
+  server->connected = 0;
+  server->_handle   = (uv_stream_t*)pipe;
+
+  server->_handle->data = server;
+  
+  if (uv_read2_start(server->_handle, on_alloc, on_pipe_connection) != 0) {
+    return 1;
+  }
+
+  return 0;
+}
+
+
 static void after_close_handle(uv_handle_t* handle) {
   free(handle);
 }
 
 
 int webserver_stop(webserver_t* server) {
+  server->_closing = 1;
+
   if (server->_handle->type == UV_TCP) {
     uv_close((uv_handle_t*)server->_handle, after_close_handle);
     return 0;
