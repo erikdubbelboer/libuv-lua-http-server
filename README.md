@@ -4,7 +4,7 @@ libuv-lua-http-server
 
 Simple example webserver using libuv and lua.
 
-A more complicated https version is available in the [https](https://github.com/ErikDubbelboer/libuv-lua-http-server/tree/https) branch.
+A simpler http only version is available in the [master](https://github.com/ErikDubbelboer/libuv-lua-http-server) branch.
 
 
 HTTPS

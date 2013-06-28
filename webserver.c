@@ -22,7 +22,7 @@
 #include <stdlib.h>  /* malloc(), free()     */
 #include <assert.h>  /* assert()             */
 #include <string.h>  /* strncat(), strncpy() */
-#include <ctype.h>   /* tolower()            */
+#include <stdio.h>   /* snprintf()           */
 
 #include "http_parser.h"
 #include "openssl/ssl.h"
@@ -453,14 +453,6 @@ static int on_url(http_parser *p, const char *buf, size_t len) {
 static int on_message_begin(http_parser *p) {
   webio_t* io = (webio_t*)p->data;
 
-  struct sockaddr_in sockname;
-  int                namelen = sizeof(sockname);
-
-  memset(&sockname, 0, sizeof(sockname));
-
-  /* If uv_tcp_getpeername() returns an error the IP will just be set to 0. */
-  uv_tcp_getpeername((uv_tcp_t*)&io->handle, (struct sockaddr*)&sockname, &namelen);
-
   io->client.method      = p->method;
   io->client.url[0]      = 0;
   io->client.cookie[0]   = 0;
@@ -639,6 +631,7 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
   server->connected = 0;
   server->_ssl      = 0;
   server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
+  server->_closing  = 0;
 
   memset(server->_handle, 0, sizeof(uv_tcp_t));
 
@@ -670,6 +663,7 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
   server->connected = 0;
   server->_ssl      = 0;
   server->_handle   = (uv_stream_t*)pipe;
+  server->_closing  = 0;
 
   server->_handle->data = server;
   
@@ -755,6 +749,7 @@ int webserver_start_ssl(webserver_t* server, const char* ip, int port, const cha
 
   server->connected = 0;
   server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
+  server->_closing  = 0;
 
   memset(server->_handle, 0, sizeof(uv_tcp_t));
 
@@ -787,6 +782,7 @@ int webserver_start_ssl2(webserver_t* server, uv_pipe_t* pipe, const char* pemfi
 
   server->connected = 0;
   server->_handle   = (uv_stream_t*)pipe;
+  server->_closing  = 0;
 
   server->_handle->data = server;
   
