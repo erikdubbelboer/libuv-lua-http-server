@@ -22,7 +22,7 @@
 #include <stdlib.h>  /* malloc(), free()     */
 #include <assert.h>  /* assert()             */
 #include <string.h>  /* strncat(), strncpy() */
-#include <ctype.h>   /* tolower()            */
+#include <stdio.h>   /* snprintf()           */
 
 #include "http_parser.h"
 
@@ -39,8 +39,6 @@ typedef struct webio_s {
     uv_pipe_t pipe;
     uv_tcp_t  tcp;
   } handle;
-
-  webserver_t* server;
 
   http_parser parser;
   uv_timer_t  timeout;
@@ -73,14 +71,30 @@ static void after_close_timeout(uv_handle_t* handle) {
 static void after_close(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
 
-  --io->server->connected;
+  --io->client.server->connected;
 
-  io->server->close_cb(&io->client);
+  assert(io->client.server->connected >= 0);
+
+  if (io->write_data) {
+    io->write_free(io->write_data);
+    io->write_data = 0;
+  }
+
+  io->client.server->close_cb(&io->client);
 
   /* We can't just free the io here, we need to close the timer first.
    * (even when it's not active anymore).
    */
   uv_close((uv_handle_t*)&io->timeout, after_close_timeout);
+}
+
+
+static void do_close(webio_t* io) {
+  uv_timer_stop(&io->timeout);
+
+  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+    uv_close((uv_handle_t*)&io->handle, after_close);
+  }
 }
 
 
@@ -92,9 +106,7 @@ static void on_timeout(uv_timer_t* handle, int status) {
   assert(status == 0);
   (void)status;  /* For release builds. */
 
-  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-    uv_close((uv_handle_t*)&io->handle, after_close);
-  }
+  do_close(io);
 }
 
 
@@ -107,39 +119,48 @@ static void after_write(uv_write_t* req, int status) {
   assert((status == 0) || (status != UV_ECANCELED));
   (void)status;  /* For release builds. */
 
-  io->write_free(io->write_data);
+  if (io->write_data) {
+    io->write_free(io->write_data);
+    io->write_data = 0;
+  } else {
+    return;
+  }
 
   /* Stop the write timeout. */
   uv_timer_stop(&io->timeout);
 
-  if (!uv_is_closing((uv_handle_t*)req->handle)) {
+  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
+    if (io->client.server->_closing) {
+      do_close(io);
+    }
 #ifdef HAVE_KEEP_ALIVE
-    if (!io->keep_alive) {
+    else if (io->keep_alive) {
+      uv_timer_start(&io->timeout, on_timeout, WEBSERVER_KEEPALIVE_TIMEOUT, 0);
+    }
 #endif
+    else {
       /* With http 1.0 client such as ApacheBench we need to close
        * the connection our selves.
        */
       if (io->client.version <= 10) {
-        uv_close((uv_handle_t*)&io->handle, after_close);
+        do_close(io);
       } else {
         /* We prefer the client to disconnect so we don't end up with
          * to many socket in the TIME_WAIT state. So set a timeout
          * after which we close the socket.
          */
-        uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+        uv_timer_start(&io->timeout, on_timeout, 5000, 0);
       }
-#ifdef HAVE_KEEP_ALIVE
     }
-#endif
   }
 }
 
 
-void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb) {
+void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout) {
   webio_t* io = client->_io;
 
   /* Start a write timeout. */
-  uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+  uv_timer_start(&io->timeout, on_timeout, timeout ? timeout : WEBSERVER_WRITE_TIMEOUT, 0);
 
   if (response) {
     io->write_data = response;
@@ -147,16 +168,14 @@ void webserver_respond(webclient_t* client, char* response, size_t size, webserv
     uv_buf_t buf   = uv_buf_init(response, size);
   
     if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
-      free(response);
+      free_cb(response);
 
-      if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-        uv_close((uv_handle_t*)&io->handle, after_close);
-      }
+      do_close(io);
     }
   } else {
-    if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-      uv_close((uv_handle_t*)&io->handle, after_close);
-    }
+    free_cb(response);
+
+    do_close(io);
   }
 }
 
@@ -174,7 +193,7 @@ static int on_message_complete(http_parser *p) {
 
   uv_timer_stop(&io->timeout);
 
-  io->server->handle_cb(&io->client);
+  io->client.server->handle_cb(&io->client);
 
   return 0;
 }
@@ -245,15 +264,6 @@ static int on_url(http_parser *p, const char *buf, size_t len) {
 static int on_message_begin(http_parser *p) {
   webio_t* io = (webio_t*)p->data;
   
-  struct sockaddr_in sockname;
-  int                namelen = sizeof(sockname);
-
-  memset(&sockname, 0, sizeof(sockname));
-
-  /* If uv_tcp_getpeername() returns an error the IP will just be set to 0. */
-  uv_tcp_getpeername((uv_tcp_t*)&io->handle, (struct sockaddr*)&sockname, &namelen);
-
-  io->client.ip          = sockname.sin_addr.s_addr;
   io->client.method      = p->method;
   io->client.url[0]      = 0;
   io->client.cookie[0]   = 0;
@@ -268,7 +278,7 @@ static int on_message_begin(http_parser *p) {
    * This will automatically stop the timer that might be running
    * if this is a keep-alive connection.
    */
-  uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+  uv_timer_start(&io->timeout, on_timeout, WEBSERVER_READ_TIMEOUT, 0);
   
   return 0;
 }
@@ -278,15 +288,20 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
   webio_t* io = (webio_t*)tcp->data;
 
   if (nread >= 0) {
-    buf.base[nread] = 0;
-
     ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buf.base, nread);
 
     if (parsed < nread) {
-      uv_close((uv_handle_t*)&io->handle, after_close);
+      if (io->client.server->error_cb) {
+        char buffer[512];
+
+        snprintf(buffer, sizeof(buffer), "http_parser_execute() = %zd, on_read = %zd\n", parsed, nread);
+        io->client.server->error_cb(buffer);
+      }
+
+      do_close(io);
     }
   } else {
-    uv_close((uv_handle_t*)&io->handle, after_close);
+    do_close(io);
   }
 
   free(buf.base);
@@ -302,23 +317,33 @@ static uv_buf_t on_alloc(uv_handle_t* handle, size_t suggested_size) {
   
 
 static void accept_connection(uv_stream_t* handle, webio_t* io) {
+  ++io->client.server->connected;
+
   if (uv_accept(handle, (uv_stream_t*)&io->handle)) {
-    uv_close((uv_handle_t*)&io->handle, after_close);
+    do_close(io);
   } else {
-    uv_timer_init(io->server->loop, &io->timeout);
-    uv_timer_start(&io->timeout, on_timeout, 2000, 0);
+    uv_timer_init(io->client.server->loop, &io->timeout);
+    uv_timer_start(&io->timeout, on_timeout, WEBSERVER_READ_TIMEOUT, 0);
 
     http_parser_init(&io->parser, HTTP_REQUEST);
 
     io->parser.data     = io;
-    io->write_req.data  = io;
     io->timeout.data    = io;
     io->client._io      = io;
+    io->write_req.data  = io;
+
+    struct sockaddr_in sockname;
+    int                namelen = sizeof(sockname);
+
+    memset(&sockname, 0, sizeof(sockname));
+
+    /* If uv_tcp_getpeername() returns an error the IP will just be set to 0. */
+    uv_tcp_getpeername((uv_tcp_t*)&io->handle, (struct sockaddr*)&sockname, &namelen);
+
+    io->client.ip = sockname.sin_addr.s_addr;
     
     if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
-      uv_close((uv_handle_t*)&io->handle, after_close);
-    } else {
-      ++io->server->connected;
+      do_close(io);
     }
   }
 }
@@ -335,7 +360,7 @@ static void on_tcp_connection(uv_stream_t* handle, int status) {
 
   uv_tcp_init(server->loop, &io->handle.tcp);
 
-  io->server          = server;
+  io->client.server   = server;
   io->handle.tcp.data = io;
 
   accept_connection(handle, io);
@@ -360,7 +385,7 @@ static void on_pipe_connection(uv_pipe_t *handle, ssize_t nread, uv_buf_t buf, u
 
   uv_pipe_init(server->loop, &io->handle.pipe, 0);
 
-  io->server          = server;
+  io->client.server    = server;
   io->handle.pipe.data = io;
 
   accept_connection((uv_stream_t*)handle, io);
@@ -383,6 +408,7 @@ static void start_common() {
 
 
 int webserver_start(webserver_t* server, const char* ip, int port) {
+  assert(server->loop);
   assert(server->handle_cb);
   assert(server->close_cb );
 
@@ -390,6 +416,7 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
 
   server->connected = 0;
   server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
+  server->_closing  = 0;
 
   memset(server->_handle, 0, sizeof(uv_tcp_t));
 
@@ -412,6 +439,7 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
 
 
 int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
+  assert(server->loop);
   assert(server->handle_cb);
   assert(server->close_cb );
 
@@ -419,6 +447,7 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
 
   server->connected = 0;
   server->_handle   = (uv_stream_t*)pipe;
+  server->_closing  = 0;
 
   server->_handle->data = server;
   
@@ -436,12 +465,25 @@ static void after_close_handle(uv_handle_t* handle) {
 
 
 int webserver_stop(webserver_t* server) {
+  server->_closing = 1;
+
   if (server->_handle->type == UV_TCP) {
     uv_close((uv_handle_t*)server->_handle, after_close_handle);
     return 0;
   } else {
     return uv_read_stop(server->_handle);
   }
+}
+
+
+const char* webserver_error(webserver_t* server) {
+  uv_err_t uverr = uv_last_error(server->loop);
+
+  if (uverr.code != UV_OK) {
+    return uv_strerror(uverr);
+  }
+
+  return 0;
 }
 
 

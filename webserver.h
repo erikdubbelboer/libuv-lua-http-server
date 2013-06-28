@@ -29,22 +29,47 @@
 #include "http_parser.h"
 
 
+#ifndef WEBSERVER_READ_TIMEOUT
+# define WEBSERVER_READ_TIMEOUT      (10*1000)
+#endif
+#ifndef WEBSERVER_WRITE_TIMEOUT
+# define WEBSERVER_WRITE_TIMEOUT     (10*1000)
+#endif
+#ifndef WEBSERVER_KEEPALIVE_TIMEOUT
+# define WEBSERVER_KEEPALIVE_TIMEOUT (5 *1000)
+#endif
+
+
 struct webclient_s;
 
 typedef void (*webserver_handle_cb)(struct webclient_s* client);
 typedef void (*webserver_close_cb )(struct webclient_s* client);
-typedef void (*webserver_free_cb  )(void* data);
+typedef void (*webserver_free_cb  )(void* buffer);
+typedef void (*webserver_error_cb )(const char* error);
 
 
 typedef struct webserver_s {
-  uv_loop_t*          loop;
+  uv_loop_t* loop;
+
+  /* This callback will be called when a new request has arrived. */
   webserver_handle_cb handle_cb;
+
+  /* This callback will be called when the connection 
+   * to the client is closed. The callback can be called
+   * for connections that haven't seen a handle_cb yet.
+   */
   webserver_close_cb  close_cb;
 
-  uint32_t connected;  /* Number of connected clients. */
+  /* This callback will be called on an error. */
+  webserver_error_cb  error_cb;
 
-  /* Fields for internal use. */
-  uv_stream_t* _handle;
+
+  /* Readonly: */
+  int connected;  /* Number of connected clients. */
+
+  /* Fields for internal use: */
+  uv_stream_t*       _handle;
+  int                _closing;
 } webserver_t;
 
 
@@ -60,15 +85,24 @@ typedef struct webclient_s {
   char agent   [1024];
   char referrer[1024];
 
+  webserver_t* server;
+
   /* Fields for internal use. */
   struct webio_s* _io;
 } webclient_t;
 
 
-void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb);
-int  webserver_start  (webserver_t* server, const char* ip, int port);
-int  webserver_start2 (webserver_t* server, uv_pipe_t* pipe);
-int  webserver_stop   (webserver_t* server);
+/**
+ * Send back a response to the client.
+ *
+ * timeout: Write timeout, 0 means WEBSERVER_WRITE_TIMEOUT.
+ *          It is advised to set a higher timeout when writing large amounts of data.
+ */
+void        webserver_respond   (webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout);
+int         webserver_start     (webserver_t* server, const char* ip, int port);
+int         webserver_start2    (webserver_t* server, uv_pipe_t* pipe);
+int         webserver_stop      (webserver_t* server);
+const char* webserver_error     (webserver_t* server);
 
 const char* webserver_reason(int status);
 
