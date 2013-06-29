@@ -13,11 +13,11 @@ HTTPS
 To generate a pem file for the pemfile option you need to concatenate your private key,
  your certificate and the intermediate certificates up to the top.
 ```
-cp certificate.key pemfile.pem
-echo >> pemfile.pem
-cat certificate.crt >> pemfile.pem
-echo >> pemfile.pem
-cat intermediate.pem >> pemfile.pem
+cp certificate.key ssl.pem
+echo >> ssl.pem
+cat certificate.crt >> ssl.pem
+echo >> ssl.pem
+cat intermediate.pem >> ssl.pem
 ```
 
 TODO:

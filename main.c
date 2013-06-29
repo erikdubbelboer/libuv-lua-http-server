@@ -431,7 +431,7 @@ int main(int argc, char* argv[]) {
   server_http.error_cb  = 0;
   
   if ((err = webserver_start(&server_http, http_ip, http_port)) != 0) {
-    printf("%s\n", webserver_error(&server_https));
+    printf("%s\n", webserver_error(&server_http));
     exit(1);
   }
 

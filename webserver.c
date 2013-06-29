@@ -250,11 +250,10 @@ static void handle_ssl_error(webio_t* io, const char* what, ssize_t n) {
 
       if (err) {
         do {
-#define WEBSERVER_VERBOSE
 #ifndef WEBSERVER_VERBOSE
           int reason = ERR_GET_REASON(err);
 
-          /* Ignore some common errors that we can do nothing about.
+          /* Ignore some common errors that we can do nothing about
            * and can ignore in almost all instances.
            *
            * TODO: why are we getting SSL_R_TLSV1_ALERT_UNKNOWN_CA when we tell
