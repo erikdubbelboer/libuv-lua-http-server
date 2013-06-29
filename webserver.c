@@ -718,7 +718,7 @@ static int start_common_ssl(webserver_t* server, const char* pemfile, const char
   /* We don't want the client to send us a client certificate. */
   SSL_CTX_set_verify(server->_ssl, SSL_VERIFY_NONE, 0);
 
-  if (SSL_CTX_use_certificate_file(server->_ssl, pemfile, SSL_FILETYPE_PEM) != 1) {
+  if (SSL_CTX_use_certificate_chain_file(server->_ssl, pemfile) != 1) {
     return 1;
   }
 
@@ -726,11 +726,11 @@ static int start_common_ssl(webserver_t* server, const char* pemfile, const char
     return 1;
   }
 
-  if (SSL_CTX_check_private_key(server->_ssl) != 1) {
+  if (SSL_CTX_set_cipher_list(server->_ssl, ciphers) != 1) {
     return 1;
   }
-  
-  if (SSL_CTX_set_cipher_list(server->_ssl, ciphers) != 1) {
+
+  if (SSL_CTX_check_private_key(server->_ssl) != 1) {
     return 1;
   }
 
@@ -795,18 +795,32 @@ int webserver_start_ssl2(webserver_t* server, uv_pipe_t* pipe, const char* pemfi
 
 
 static void after_close_handle(uv_handle_t* handle) {
+  webserver_t* server = (webserver_t*)handle->data;
+
+  if (server->stop_cb) {
+    server->stop_cb(server);
+  }
+
   free(handle);
 }
 
 
 int webserver_stop(webserver_t* server) {
+  assert(!server->_closing);
+
   server->_closing = 1;
 
   if (server->_handle->type == UV_TCP) {
     uv_close((uv_handle_t*)server->_handle, after_close_handle);
     return 0;
   } else {
-    return uv_read_stop(server->_handle);
+    int r = uv_read_stop(server->_handle);
+
+    if ((r == 0) && (server->stop_cb)) {
+      server->stop_cb(server);
+    }
+
+    return r;
   }
 }
 
