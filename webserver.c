@@ -24,9 +24,13 @@
 #include <string.h>  /* strncat(), strncpy() */
 #include <stdio.h>   /* snprintf()           */
 
+#if HAVE_OPENSSL
+#include <openssl/conf.h>  /* OPENSSL_config() */
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
+
 #include "http_parser.h"
-#include "openssl/ssl.h"
-#include "openssl/err.h"
 
 #include "webserver.h"
 
@@ -42,16 +46,21 @@ typedef struct webio_s {
     uv_tcp_t  tcp;
   } handle;
 
-  SSL*      ssl;
-  uv_poll_t ssl_poll;
+#if HAVE_OPENSSL
+  SSL* ssl;
+  BIO* ssl_write;
+  BIO* ssl_read;
+#endif
 
   http_parser parser;
   uv_timer_t  timeout;
   
   uv_write_t        write_req;
   char*             write_data;
-  size_t            write_size;
   webserver_free_cb write_free;
+
+  int active_writes;
+  int should_close;
 
 #ifdef HAVE_KEEP_ALIVE
   int keep_alive;
@@ -64,11 +73,19 @@ typedef struct webio_s {
 } webio_t;
 
 
-static void on_poll(uv_poll_t* handle, int status, int events);
+typedef struct webwrite_s {
+  webio_t*   io;
+  char       data[1024 * 4];
+  uv_write_t req;
+} webwrite_t;
 
 
 static http_parser_settings parser_settings;
-static int                  ssl_init = 0;
+
+#if HAVE_OPENSSL
+static void flush_write_bio(webio_t* io);
+
+static int ssl_init = 0;
 
 
 static void shutdown_ssl(webserver_t* server) {
@@ -86,16 +103,19 @@ static void shutdown_ssl(webserver_t* server) {
 
   ssl_init = 0;
 }
+#endif  /* HAVE_OPENSSL */
 
 
 static void after_close_timeout(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
 
+#if HAVE_OPENSSL
   if ( io->client.server->_ssl     &&
        io->client.server->_closing &&
       (io->client.server->connected == 0)) {
     shutdown_ssl(io->client.server);
   }
+#endif
 
   free(io);
 }
@@ -113,9 +133,11 @@ static void after_close(uv_handle_t* handle) {
     io->write_data = 0;
   }
 
+#if HAVE_OPENSSL
   if (io->ssl) {
     SSL_free(io->ssl);
   }
+#endif
 
   io->client.server->close_cb(&io->client);
 
@@ -126,29 +148,16 @@ static void after_close(uv_handle_t* handle) {
 }
 
 
-static void after_close_poll(uv_handle_t* handle) {
-  webio_t* io = (webio_t*)handle->data;
-  
-  if (!uv_is_closing((uv_handle_t*)&io->handle)) {
-    uv_close((uv_handle_t*)&io->handle, after_close);
-  }
-}
-
-
 static void do_close(webio_t* io) {
   uv_timer_stop(&io->timeout);
 
+#if HAVE_OPENSSL
   if (io->ssl) {
-    SSL_shutdown(io->ssl);
-
-    /* This is a bit hacky but otherwise we would need a new variable
-     * to indicate if poll_init has been called.
-     */
-    if (io->ssl_poll.data) {
-      uv_close((uv_handle_t*)&io->ssl_poll, after_close_poll);
-      return;
+    if (SSL_shutdown(io->ssl) >= 0) {
+      flush_write_bio(io);
     }
   }
+#endif
 
   if (!uv_is_closing((uv_handle_t*)&io->handle)) {
     uv_close((uv_handle_t*)&io->handle, after_close);
@@ -168,22 +177,7 @@ static void on_timeout(uv_timer_t* handle, int status) {
 }
 
 
-static void after_write(uv_write_t* req, int status) {
-  webio_t* io = (webio_t*)req->data;
-
-  /* status will be set to UV_ECANCELED when the connection
-   * is closed durint the write.
-   */
-  assert((status == 0) || (status != UV_ECANCELED));
-  (void)status;  /* For release builds. */
-
-  if (io->write_data) {
-    io->write_free(io->write_data);
-    io->write_data = 0;
-  } else {
-    return;
-  }
-
+static void after_write_common(webio_t* io) {
   /* Stop the write timeout. */
   uv_timer_stop(&io->timeout);
 
@@ -214,6 +208,75 @@ static void after_write(uv_write_t* req, int status) {
 }
 
 
+static void after_write_http(uv_write_t* req, int status) {
+  webio_t* io = (webio_t*)req->data;
+
+  /* status will be set to UV_ECANCELED when the connection
+   * is closed durint the write.
+   */
+  assert((status == 0) || (status != UV_ECANCELED));
+  (void)status;  /* For release builds. */
+
+  if (io->write_data) {
+    io->write_free(io->write_data);
+    io->write_data = 0;
+  } else {
+    return;
+  }
+
+  after_write_common(io);
+}
+
+
+#if HAVE_OPENSSL
+static void after_write_https(uv_write_t* req, int status) {
+  webwrite_t* w = (webwrite_t*)req->data;
+  
+  /* status will be set to UV_ECANCELED when the connection
+   * is closed durint the write.
+   */
+  assert((status == 0) || (status != UV_ECANCELED));
+  (void)status;  /* For release builds. */
+
+  --w->io->active_writes;
+
+  assert(w->io->active_writes >= 0);
+
+  if ((w->io->active_writes == 0) && (w->io->should_close)) {
+    after_write_common(w->io);
+  }
+
+  free(w);
+}
+
+
+static void flush_write_bio(webio_t* io) {
+  char buffer[1024 * 4];
+  int  bread;
+
+  while ((bread = BIO_read(io->ssl_write, buffer, sizeof(buffer))) > 0) {
+    webwrite_t* w = malloc(sizeof(*w));
+
+    w->io = io;
+    memcpy(w->data, buffer, bread);
+
+    w->req.data = w;
+
+    uv_buf_t buf = uv_buf_init(w->data, bread);
+  
+    if (uv_write(&w->req, (uv_stream_t*)&io->handle, &buf, 1, after_write_https) != 0) {
+      free(w);
+
+      do_close(io);
+
+      break;
+    } else {
+      ++io->active_writes;
+    }
+  }
+}
+
+
 static const char* ssl_get_state(SSL* ssl) {
   return (SSL_is_init_finished(ssl) ? "init finished" :
          (SSL_in_init(ssl)          ? "init"          :
@@ -229,9 +292,12 @@ static void handle_ssl_error(webio_t* io, const char* what, ssize_t n) {
   int  ssl_error = SSL_get_error(io->ssl, n);
 
   if (ssl_error == SSL_ERROR_WANT_WRITE) {
-    uv_poll_start(&io->ssl_poll, UV_READABLE | UV_WRITABLE, on_poll);
+    flush_write_bio(io);
   } else if (ssl_error == SSL_ERROR_WANT_READ) {
-    /* We are always listening for read events so we can ignore this. */
+    /* SSL_ERROR_WANT_READ may indicate some data was written to the output and openssl
+     * is now waiting for a response. So flush our write buffers.
+     */
+    flush_write_bio(io);
   } else {
     if ((ssl_error != SSL_ERROR_ZERO_RETURN) && io->client.server->error_cb) {
       /*
@@ -250,14 +316,18 @@ static void handle_ssl_error(webio_t* io, const char* what, ssize_t n) {
 
       if (err) {
         do {
-#ifndef WEBSERVER_VERBOSE
           int reason = ERR_GET_REASON(err);
 
+          /* The connection was shut down before we responded.
+           * This can always be ignored.
+           */
+          if (reason == SSL_R_PROTOCOL_IS_SHUTDOWN) {
+            continue;
+          }
+
+#ifndef WEBSERVER_VERBOSE
           /* Ignore some common errors that we can do nothing about
            * and can ignore in almost all instances.
-           *
-           * TODO: why are we getting SSL_R_TLSV1_ALERT_UNKNOWN_CA when we tell
-           * OpenSSL not to check for client certificates (SSL_VERIFY_NONE)?
            */
           if ((reason != SSL_R_SSL_HANDSHAKE_FAILURE          ) &&
               /* Clients that don't know our intermediate ca? */
@@ -288,54 +358,7 @@ static void handle_ssl_error(webio_t* io, const char* what, ssize_t n) {
     do_close(io);
   }
 }
-
-
-static void on_poll(uv_poll_t* handle, int status, int events) {
-  (void)status;
-
-  webio_t* io = (webio_t*)handle->data;
-  ssize_t  n;
-
-  ERR_clear_error();
-
-  if (events & UV_READABLE) {
-    char buffer[1024 * 4];
-
-    while ((n = SSL_read(io->ssl, buffer, sizeof(buffer))) > 0) {
-      ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buffer, n);
-
-      if (parsed < n) {
-        if (io->client.server->error_cb) {
-          char buffer[512];
-
-          snprintf(buffer, sizeof(buffer), "http_parser_execute() = %zd, SSL_read() = %zd\n", parsed, n);
-          io->client.server->error_cb(buffer);
-        }
-
-        do_close(io);
-        break;
-      }
-    }
-
-    if (n <= 0) {
-      handle_ssl_error(io, "read", n);
-      return;
-    }
-  }
-
-  if ((events & UV_WRITABLE) && io->write_data) {
-    n = SSL_write(io->ssl, io->write_data, io->write_size);
-
-    if (n != (ssize_t)io->write_size) {
-      handle_ssl_error(io, "write", n);
-    } else {
-      /* Go back to just reading. */
-      uv_poll_start(&io->ssl_poll, UV_READABLE, on_poll);
-
-      after_write(&io->write_req, 0);
-    }
-  }
-}
+#endif  /* HAVE_OPENSSL */
 
 
 void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout) {
@@ -345,21 +368,36 @@ void webserver_respond(webclient_t* client, char* response, size_t size, webserv
   uv_timer_start(&io->timeout, on_timeout, timeout ? timeout : WEBSERVER_WRITE_TIMEOUT, 0);
 
   if (response) {
-    io->write_data = response;
-    io->write_size = size;
-    io->write_free = free_cb;
-
+#if HAVE_OPENSSL
     if (io->ssl) {
-      uv_poll_start(&io->ssl_poll, UV_READABLE | UV_WRITABLE, on_poll);
+      ERR_clear_error();
+
+      ssize_t r = SSL_write(io->ssl, response, size);
+
+      if (r != (ssize_t)size) {
+        handle_ssl_error(io, "write", r);
+      } else {
+        io->should_close = 1;
+
+        flush_write_bio(io);
+      }
+
+      free_cb(response);
     } else {
+#endif
+      io->write_data = response;
+      io->write_free = free_cb;
+
       uv_buf_t buf = uv_buf_init(response, size);
     
-      if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
+      if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write_http) != 0) {
         free_cb(response);
 
         do_close(io);
       }
+#if HAVE_OPENSSL
     }
+#endif
   } else {
     free_cb(response);
 
@@ -458,6 +496,10 @@ static int on_message_begin(http_parser *p) {
   io->client.agent[0]    = 0;
   io->client.referrer[0] = 0;
 
+  assert(io->should_close == 0);
+
+  io->should_close = 0;
+
 #ifdef HAVE_KEEP_ALIVE
   io->keep_alive = 0;
 #endif
@@ -476,18 +518,55 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
   webio_t* io = (webio_t*)tcp->data;
 
   if (nread >= 0) {
-    ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buf.base, nread);
+#if HAVE_OPENSSL
+    if (io->ssl) {
+      int n = BIO_write(io->ssl_read, buf.base, nread);
+     
+      if (n != nread) {
+        do_close(io);
+      } else {
+        char    buffer[1024 * 4];
+        ssize_t bread;
 
-    if (parsed < nread) {
-      if (io->client.server->error_cb) {
-        char buffer[512];
+        ERR_clear_error();
 
-        snprintf(buffer, sizeof(buffer), "http_parser_execute() = %zd, on_read = %zd\n", parsed, nread);
-        io->client.server->error_cb(buffer);
+        while ((bread = SSL_read(io->ssl, buffer, sizeof(buffer))) > 0) {
+          ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buffer, bread);
+
+          if (parsed < bread) {
+            if (io->client.server->error_cb) {
+              char buffer[512];
+
+              snprintf(buffer, sizeof(buffer), "http_parser_execute() = %zd, on_read = %zd\n", parsed, bread);
+              io->client.server->error_cb(buffer);
+            }
+
+            do_close(io);
+            break;
+          }
+        }
+
+        if (bread <= 0) {
+          handle_ssl_error(io, "read", bread);
+        }
       }
+    } else {
+#endif  /* HAVE_OPENSSL */
+      ssize_t parsed = http_parser_execute(&io->parser, &parser_settings, buf.base, nread);
 
-      do_close(io);
+      if (parsed < nread) {
+        if (io->client.server->error_cb) {
+          char buffer[512];
+
+          snprintf(buffer, sizeof(buffer), "http_parser_execute() = %zd, on_read = %zd\n", parsed, nread);
+          io->client.server->error_cb(buffer);
+        }
+
+        do_close(io);
+      }
+#if HAVE_OPENSSL
     }
+#endif  /* HAVE_OPENSSL */
   } else {
     do_close(io);
   }
@@ -530,6 +609,7 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
 
     io->client.ip = sockname.sin_addr.s_addr;
 
+#if HAVE_OPENSSL
     if (io->client.server->_ssl) {
       io->ssl = SSL_new(io->client.server->_ssl);
       
@@ -540,22 +620,15 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
         return;
       }
 
-      int fd = io->handle.tcp.io_watcher.fd;
+      io->ssl_write = BIO_new(BIO_s_mem());
+      io->ssl_read  = BIO_new(BIO_s_mem());
 
-      SSL_set_fd(io->ssl, fd);
+      SSL_set_bio(io->ssl, io->ssl_read, io->ssl_write);
       SSL_set_accept_state(io->ssl);
-
-      if (uv_poll_init(io->client.server->loop, &io->ssl_poll, fd) != 0) {
-        /* uv_poll_init() can't fail in the current version of libuv. */
-        assert(0);
-
-        do_close(io);
-      } else {
-        io->ssl_poll.data = io;
-
-        uv_poll_start(&io->ssl_poll, UV_READABLE, on_poll);
-      }
-    } else if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
+    }
+#endif
+    
+    if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
       do_close(io);
     }
   }
@@ -628,7 +701,9 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
   start_common();
 
   server->connected = 0;
+#if HAVE_OPENSSL
   server->_ssl      = 0;
+#endif
   server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
   server->_closing  = 0;
 
@@ -660,7 +735,9 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
   start_common();
 
   server->connected = 0;
+#if HAVE_OPENSSL
   server->_ssl      = 0;
+#endif
   server->_handle   = (uv_stream_t*)pipe;
   server->_closing  = 0;
 
@@ -674,10 +751,12 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
 }
 
 
+#if HAVE_OPENSSL
 static int start_common_ssl(webserver_t* server, const char* pemfile, const char* ciphers) {
   start_common();
 
   if (!ssl_init) {
+    OPENSSL_config(0);
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
@@ -692,16 +771,21 @@ static int start_common_ssl(webserver_t* server, const char* pemfile, const char
     return 1;
   }
 
+#ifdef OPENSSL_NO_COMP
   /* Turn off compression.
    * See: http://en.wikipedia.org/wiki/CRIME_%28security_exploit%29
    */
   if (!(SSL_OP_NO_COMPRESSION & SSL_CTX_set_options(server->_ssl, SSL_OP_NO_COMPRESSION))) {
     return 1;
   }
+#endif
 
   if (!(SSL_OP_CIPHER_SERVER_PREFERENCE & SSL_CTX_set_options(server->_ssl, SSL_OP_CIPHER_SERVER_PREFERENCE))) {
     return 1;
   }
+
+  /* Enable all bug work-arounds. */
+  SSL_CTX_set_options(server->_ssl, SSL_OP_ALL);
 
   SSL_CTX_set_session_cache_mode(server->_ssl, SSL_SESS_CACHE_OFF);
 
@@ -791,6 +875,7 @@ int webserver_start_ssl2(webserver_t* server, uv_pipe_t* pipe, const char* pemfi
 
   return 0;
 }
+#endif  /* HAVE_OPENSSL */
 
 
 static void after_close_handle(uv_handle_t* handle) {
@@ -831,11 +916,13 @@ const char* webserver_error(webserver_t* server) {
     return uv_strerror(uverr);
   }
 
+#if HAVE_OPENSSL
   unsigned long sslerr = ERR_get_error();
 
   if (sslerr != 0) {
     return ERR_error_string(sslerr, 0);
   }
+#endif
 
   return 0;
 }

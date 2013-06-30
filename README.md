@@ -6,6 +6,9 @@ Simple example webserver using libuv and lua.
 
 A simpler http only version is available in the [master](https://github.com/ErikDubbelboer/libuv-lua-http-server) branch.
 
+The [https1](https://github.com/ErikDubbelboer/libuv-lua-http-server/tree/https1) branch contains a different implementation of the SSL related code.
+The [https1](https://github.com/ErikDubbelboer/libuv-lua-http-server/tree/https1) branch uses uv\_poll and lets OpenSSL handle the IO. While the [https2](https://github.com/ErikDubbelboer/libuv-lua-http-server/tree/https2) branch uses libuv's IO functions.
+
 
 HTTPS
 -----
