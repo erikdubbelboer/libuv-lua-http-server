@@ -24,9 +24,12 @@
 #include <string.h>  /* strncat(), strncpy() */
 #include <stdio.h>   /* snprintf()           */
 
+#if HAVE_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
+
 #include "http_parser.h"
-#include "openssl/ssl.h"
-#include "openssl/err.h"
 
 #include "webserver.h"
 
@@ -42,8 +45,10 @@ typedef struct webio_s {
     uv_tcp_t  tcp;
   } handle;
 
+#if HAVE_OPENSSL
   SSL*      ssl;
   uv_poll_t ssl_poll;
+#endif
 
   http_parser parser;
   uv_timer_t  timeout;
@@ -64,11 +69,13 @@ typedef struct webio_s {
 } webio_t;
 
 
+static http_parser_settings parser_settings;
+
+
+#if HAVE_OPENSSL
 static void on_poll(uv_poll_t* handle, int status, int events);
 
-
-static http_parser_settings parser_settings;
-static int                  ssl_init = 0;
+static int ssl_init = 0;
 
 
 static void shutdown_ssl(webserver_t* server) {
@@ -86,16 +93,19 @@ static void shutdown_ssl(webserver_t* server) {
 
   ssl_init = 0;
 }
+#endif
 
 
 static void after_close_timeout(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
 
+#if HAVE_OPENSSL
   if ( io->client.server->_ssl     &&
        io->client.server->_closing &&
       (io->client.server->connected == 0)) {
     shutdown_ssl(io->client.server);
   }
+#endif
 
   free(io);
 }
@@ -113,9 +123,11 @@ static void after_close(uv_handle_t* handle) {
     io->write_data = 0;
   }
 
+#if HAVE_OPENSSL
   if (io->ssl) {
     SSL_free(io->ssl);
   }
+#endif
 
   io->client.server->close_cb(&io->client);
 
@@ -126,6 +138,7 @@ static void after_close(uv_handle_t* handle) {
 }
 
 
+#if HAVE_OPENSSL
 static void after_close_poll(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
   
@@ -133,11 +146,13 @@ static void after_close_poll(uv_handle_t* handle) {
     uv_close((uv_handle_t*)&io->handle, after_close);
   }
 }
+#endif
 
 
 static void do_close(webio_t* io) {
   uv_timer_stop(&io->timeout);
 
+#if HAVE_OPENSSL
   if (io->ssl) {
     SSL_shutdown(io->ssl);
 
@@ -149,6 +164,7 @@ static void do_close(webio_t* io) {
       return;
     }
   }
+#endif
 
   if (!uv_is_closing((uv_handle_t*)&io->handle)) {
     uv_close((uv_handle_t*)&io->handle, after_close);
@@ -214,6 +230,7 @@ static void after_write(uv_write_t* req, int status) {
 }
 
 
+#if HAVE_OPENSSL
 static const char* ssl_get_state(SSL* ssl) {
   return (SSL_is_init_finished(ssl) ? "init finished" :
          (SSL_in_init(ssl)          ? "init"          :
@@ -250,14 +267,12 @@ static void handle_ssl_error(webio_t* io, const char* what, ssize_t n) {
 
       if (err) {
         do {
+#define WEBSERVER_VERBOSE
 #ifndef WEBSERVER_VERBOSE
           int reason = ERR_GET_REASON(err);
 
           /* Ignore some common errors that we can do nothing about
            * and can ignore in almost all instances.
-           *
-           * TODO: why are we getting SSL_R_TLSV1_ALERT_UNKNOWN_CA when we tell
-           * OpenSSL not to check for client certificates (SSL_VERIFY_NONE)?
            */
           if ((reason != SSL_R_SSL_HANDSHAKE_FAILURE          ) &&
               /* Clients that don't know our intermediate ca? */
@@ -336,6 +351,7 @@ static void on_poll(uv_poll_t* handle, int status, int events) {
     }
   }
 }
+#endif  /* HAVE_OPENSSL */
 
 
 void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout) {
@@ -349,9 +365,11 @@ void webserver_respond(webclient_t* client, char* response, size_t size, webserv
     io->write_size = size;
     io->write_free = free_cb;
 
+#if HAVE_OPENSSL
     if (io->ssl) {
       uv_poll_start(&io->ssl_poll, UV_READABLE | UV_WRITABLE, on_poll);
     } else {
+#endif
       uv_buf_t buf = uv_buf_init(response, size);
     
       if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
@@ -359,7 +377,9 @@ void webserver_respond(webclient_t* client, char* response, size_t size, webserv
 
         do_close(io);
       }
+#if HAVE_OPENSSL
     }
+#endif
   } else {
     free_cb(response);
 
@@ -530,6 +550,7 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
 
     io->client.ip = sockname.sin_addr.s_addr;
 
+#if HAVE_OPENSSL
     if (io->client.server->_ssl) {
       io->ssl = SSL_new(io->client.server->_ssl);
       
@@ -555,7 +576,9 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
 
         uv_poll_start(&io->ssl_poll, UV_READABLE, on_poll);
       }
-    } else if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
+    } else
+#endif  /* HAVE_OPENSSL */
+    if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
       do_close(io);
     }
   }
@@ -628,7 +651,9 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
   start_common();
 
   server->connected = 0;
+#if HAVE_OPENSSL
   server->_ssl      = 0;
+#endif
   server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
   server->_closing  = 0;
 
@@ -660,7 +685,9 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
   start_common();
 
   server->connected = 0;
+#if HAVE_OPENSSL
   server->_ssl      = 0;
+#endif
   server->_handle   = (uv_stream_t*)pipe;
   server->_closing  = 0;
 
@@ -674,6 +701,7 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
 }
 
 
+#if HAVE_OPENSSL
 static int start_common_ssl(webserver_t* server, const char* pemfile, const char* ciphers) {
   start_common();
 
@@ -692,12 +720,14 @@ static int start_common_ssl(webserver_t* server, const char* pemfile, const char
     return 1;
   }
 
+#ifdef OPENSSL_NO_COMP
   /* Turn off compression.
    * See: http://en.wikipedia.org/wiki/CRIME_%28security_exploit%29
    */
   if (!(SSL_OP_NO_COMPRESSION & SSL_CTX_set_options(server->_ssl, SSL_OP_NO_COMPRESSION))) {
     return 1;
   }
+#endif
 
   if (!(SSL_OP_CIPHER_SERVER_PREFERENCE & SSL_CTX_set_options(server->_ssl, SSL_OP_CIPHER_SERVER_PREFERENCE))) {
     return 1;
@@ -791,6 +821,7 @@ int webserver_start_ssl2(webserver_t* server, uv_pipe_t* pipe, const char* pemfi
 
   return 0;
 }
+#endif  /* HAVE_OPENSSL */
 
 
 static void after_close_handle(uv_handle_t* handle) {
@@ -831,11 +862,13 @@ const char* webserver_error(webserver_t* server) {
     return uv_strerror(uverr);
   }
 
+#if HAVE_OPENSSL
   unsigned long sslerr = ERR_get_error();
 
   if (sslerr != 0) {
     return ERR_error_string(sslerr, 0);
   }
+#endif
 
   return 0;
 }

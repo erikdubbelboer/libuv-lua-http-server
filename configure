@@ -39,7 +39,79 @@ parser.add_option("--debug",
     dest="debug",
     help="Build debug version")
 
+parser.add_option("--without-ssl",
+    action="store_true",
+    dest="without_ssl",
+    help="Build without SSL")
+
+parser.add_option("--shared-openssl",
+    action="store_true",
+    dest="shared_openssl",
+    help="Link to a shared OpenSSl DLL instead of static linking")
+
+parser.add_option("--shared-openssl-includes",
+    action="store",
+    dest="shared_openssl_includes",
+    help="Directory containing OpenSSL header files")
+
+parser.add_option("--shared-openssl-libpath",
+    action="store",
+    dest="shared_openssl_libpath",
+    help="A directory to search for the shared OpenSSL DLLs")
+
+parser.add_option("--shared-openssl-libname",
+    action="store",
+    dest="shared_openssl_libname",
+    help="Alternative lib name to link to (default: 'crypto,ssl')")
+
+parser.add_option("--with-ssl-compression",
+    action="store_true",
+    dest="with_ssl_compression",
+    help="Enable ssl compression (not advised, see CRIME exploit)")
+
+parser.add_option("--shared-zlib",
+    action="store_true",
+    dest="shared_zlib",
+    help="Link to a shared zlib DLL instead of static linking")
+
+parser.add_option("--shared-zlib-includes",
+    action="store",
+    dest="shared_zlib_includes",
+    help="Directory containing zlib header files")
+
+parser.add_option("--shared-zlib-libpath",
+    action="store",
+    dest="shared_zlib_libpath",
+    help="A directory to search for the shared zlib DLL")
+
+parser.add_option("--shared-zlib-libname",
+    action="store",
+    dest="shared_zlib_libname",
+    help="Alternative lib name to link to (default: 'z')")
+
 (options, args) = parser.parse_args()
+
+
+def b(value):
+  """Returns the string 'true' if value is truthy, 'false' otherwise."""
+  if value:
+    return 'true'
+  else:
+    return 'false'
+
+
+def pkg_config(pkg):
+  cmd = os.popen('pkg-config --libs %s' % pkg, 'r')
+  libs = cmd.readline().strip()
+  ret = cmd.close()
+  if (ret): return None
+
+  cmd = os.popen('pkg-config --cflags %s' % pkg, 'r')
+  cflags = cmd.readline().strip()
+  ret = cmd.close()
+  if (ret): return None
+
+  return (libs, cflags)
 
 
 def cc_macros():
@@ -109,6 +181,59 @@ def host_arch_win():
   return matchup.get(arch, 'ia32')
 
 
+def configure_openssl(o):
+  o['variables']['use_openssl']    = b(not options.without_ssl)
+  o['variables']['shared_openssl'] = b(options.shared_openssl)
+
+  if options.without_ssl:
+    return
+
+  o['defines'] += ['OPENSSL_NO_SSL2=1']
+
+  if options.with_ssl_compression:
+    o['variables']['use_zlib'] = 'true'
+    o['defines'] += ['ZLIB']
+  else:
+    o['defines'] += ['OPENSSL_NO_COMP']
+
+  if options.shared_openssl:
+    (libs, cflags) = pkg_config('openssl') or ('-lssl -lcrypto', '')
+
+    if options.shared_openssl_libpath:
+      o['libraries'] += ['-L%s' % options.shared_openssl_libpath]
+
+    if options.shared_openssl_libname:
+      libnames = options.shared_openssl_libname.split(',')
+      o['libraries'] += ['-l%s' % s for s in libnames]
+    else:
+      o['libraries'] += libs.split()
+
+    if options.shared_openssl_includes:
+      o['include_dirs'] += [options.shared_openssl_includes]
+    else:
+      o['cflags'] += cflags.split()
+
+
+def configure_zlib(o):
+  o['variables']['shared_zlib'] = b(options.shared_zlib)
+
+  if options.shared_zlib:
+    (libs, cflags) = pkg_config('zlib') or ('-lz', '')
+
+    if options.shared_zlib_libpath:
+      o['libraries'] += ['-L%s' % options.shared_zlib_libpath]
+
+    if options.shared_zlib_libname:
+      o['libraries'] += ['-l%s' % options.shared_zlib_libname]
+    else:
+      o['libraries'] += libs.split()
+
+    if options.shared_zlib_includes:
+      o['include_dirs'] += [options.shared_zlib_includes]
+    else:
+      o['cflags'] += cflags.split()
+
+
 def configure(o):
   o['default_configuration'] = 'Debug' if options.debug else 'Release'
 
@@ -126,6 +251,8 @@ output = {
 }
 
 configure(output)
+configure_openssl(output)
+configure_zlib(output)
 
 # variables should be a root level element,
 # move everything else to target_defaults

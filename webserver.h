@@ -74,7 +74,9 @@ typedef struct webserver_s {
 
   /* Fields for internal use: */
   uv_stream_t*       _handle;
+#if HAVE_OPENSSL
   struct ssl_ctx_st* _ssl;
+#endif
   int                _closing;
 } webserver_t;
 
@@ -107,15 +109,17 @@ typedef struct webclient_s {
 void        webserver_respond   (webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout);
 int         webserver_start     (webserver_t* server, const char* ip, int port);
 int         webserver_start2    (webserver_t* server, uv_pipe_t* pipe);
+int         webserver_stop      (webserver_t* server);
+const char* webserver_error     (webserver_t* server);
 
+#if HAVE_OPENSSL
 /**
  * ciphers: See http://www.openssl.org/docs/apps/ciphers.html#CIPHER_LIST_FORMAT
  *          Recommended is: "ECDHE-RSA-AES128-SHA256:AES128-GCM-SHA256:RC4:HIGH:!MD5:!aNULL:!EDH"
  */
 int         webserver_start_ssl (webserver_t* server, const char* ip, int port, const char* pemfile, const char* ciphers);
 int         webserver_start_ssl2(webserver_t* server, uv_pipe_t* pipe, const char* pemfile, const char* ciphers);
-int         webserver_stop      (webserver_t* server);
-const char* webserver_error     (webserver_t* server);
+#endif 
 
 const char* webserver_reason(int status);
 

@@ -18,7 +18,7 @@
     'target_defaults': {
       'defines': [
         'LUAJIT_ENABLE_LUA52COMPAT',
-      'LUA_USE_APICHECK',
+        'LUA_USE_APICHECK',
       ],
       'conditions': [
         ['target_arch=="x64"', {

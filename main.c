@@ -19,9 +19,12 @@
 // IN THE SOFTWARE.
 //
 
-#include <stdio.h>   /* printf()  */
-#include <stdlib.h>  /* exit()    */
-#include <assert.h>  /* assert()  */
+#include <stdio.h>          /* printf()    */
+#include <stdlib.h>         /* exit()      */
+#include <assert.h>         /* assert()    */
+#if !defined(_MSC_VER)
+# include <sys/resource.h>  /* getrlimit() */
+#endif
 
 #include "uv.h"
 #include "parson.h"
@@ -63,8 +66,13 @@ LRU_TYPE(lru_entry_s) scriptlru;
 
 LRU_GENERATE_STATIC(lru_entry_s, lru_compare, lru_free, lru)
 
+static uv_loop_t* loop;
+
 static webserver_t server_http;
 static webserver_t server_https;
+
+static uv_timer_t print;
+static uint32_t   handled = 0;
     
 
 char* lua_error_handler = 
@@ -112,12 +120,16 @@ static int clua_shutdown(lua_State* L) {
 
   webserver_stop(&server_http);
   webserver_stop(&server_https);
+  
+  UV_CHECK(uv_timer_stop(&print));
 
   return 0;
 }
 
 
 static void on_webserver_handle(webclient_t* web, int https) {
+  ++handled;
+
   char file[512];
 
   strncpy(file, web->url, 511);
@@ -373,6 +385,22 @@ static void on_webserver_error(const char* error) {
 }
 
 
+static void on_print(uv_timer_t* handle, int status) {
+  (void)handle;
+  (void)status;
+
+  static int printed = 40-1;
+
+  if (++printed == 40) {
+    printf("handled    http   https\n");
+    printed = 0;
+  }
+
+  printf("%6u   %6u  %6u\n", handled, server_http.connected, server_https.connected);
+  handled = 0;
+}
+
+
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     printf("missing config file\n");
@@ -410,6 +438,8 @@ int main(int argc, char* argv[]) {
   }
 
 
+#if !defined(_MSC_VER)
+  /* Disable SIGPIPE. */
   struct sigaction sa;
 
   memset(&sa, 0, sizeof(sa));
@@ -418,11 +448,36 @@ int main(int argc, char* argv[]) {
   sigaction(SIGPIPE, &sa, 0);
 
 
+  /* Try to increase our open file limit to it's max. */
+  struct rlimit limit;
+
+  if (getrlimit(RLIMIT_NOFILE, &limit) == -1) {
+    perror("getrlimit");
+    exit(1);
+  }
+
+  if (limit.rlim_max > limit.rlim_cur) {
+    printf("increasing nofile to %lu\n", limit.rlim_cur);
+
+    limit.rlim_cur = limit.rlim_max;
+
+    if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+      perror("setrlimit");
+      exit(1);
+    }
+  }
+#endif  /* !defined(_MSC_VER) */
+
+
   LRU_INIT(&scriptlru, cachesize);
 
 
-  uv_loop_t* loop = uv_default_loop();
-  int        err;
+  loop = uv_default_loop();
+  int err;
+
+
+  UV_CHECK(uv_timer_init(loop, &print));
+  UV_CHECK(uv_timer_start(&print, on_print, 6000, 6000));
 
 
   server_http.loop      = loop;

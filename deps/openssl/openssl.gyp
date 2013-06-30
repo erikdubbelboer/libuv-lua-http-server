@@ -915,6 +915,9 @@
         ['target_arch=="arm"', {
           'sources': ['openssl/crypto/armcap.c'],
         }],
+        ['shared_zlib=="false"', {
+          'dependencies': ['../zlib/zlib.gyp:zlib']
+        }]
       ],
       'include_dirs': [
         '.',
