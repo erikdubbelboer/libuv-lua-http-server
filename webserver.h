@@ -40,11 +40,13 @@
 #endif
 
 
+struct webserver_s;
 struct webclient_s;
 
 typedef void (*webserver_handle_cb)(struct webclient_s* client);
 typedef void (*webserver_close_cb )(struct webclient_s* client);
 typedef void (*webserver_free_cb  )(void* buffer);
+typedef void (*webserver_stop_cb  )(struct webserver_s* server);
 typedef void (*webserver_error_cb )(const char* error);
 
 
@@ -62,6 +64,9 @@ typedef struct webserver_s {
 
   /* This callback will be called on an error. */
   webserver_error_cb  error_cb;
+  
+  /* This is called when the server has closed it's listening socket. */
+  webserver_stop_cb   stop_cb;
 
 
   /* Readonly: */

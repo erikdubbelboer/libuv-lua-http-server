@@ -327,10 +327,10 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
 
     http_parser_init(&io->parser, HTTP_REQUEST);
 
-    io->parser.data     = io;
-    io->timeout.data    = io;
-    io->client._io      = io;
-    io->write_req.data  = io;
+    io->parser.data    = io;
+    io->timeout.data   = io;
+    io->client._io     = io;
+    io->write_req.data = io;
 
     struct sockaddr_in sockname;
     int                namelen = sizeof(sockname);
@@ -460,18 +460,32 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
 
 
 static void after_close_handle(uv_handle_t* handle) {
+  webserver_t* server = (webserver_t*)handle->data;
+
+  if (server->stop_cb) {
+    server->stop_cb(server);
+  }
+
   free(handle);
 }
 
 
 int webserver_stop(webserver_t* server) {
+  assert(!server->_closing);
+
   server->_closing = 1;
 
   if (server->_handle->type == UV_TCP) {
     uv_close((uv_handle_t*)server->_handle, after_close_handle);
     return 0;
   } else {
-    return uv_read_stop(server->_handle);
+    int r = uv_read_stop(server->_handle);
+
+    if ((r == 0) && (server->stop_cb)) {
+      server->stop_cb(server);
+    }
+
+    return r;
   }
 }
 
