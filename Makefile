@@ -53,5 +53,9 @@ distclean: clean
 	-rm -f config.mk
 
 
-.PHONY: all $(TARGETS)
+test: $(TARGETS)
+	node test/runtest.js
+
+
+.PHONY: all clean distclean test $(TARGETS)
 

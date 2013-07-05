@@ -1,23 +1,23 @@
-//
-// Copyright Erik Dubbelboer. and other contributors. All rights reserved.
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to
-// deal in the Software without restriction, including without limitation the
-// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-// sell copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-// IN THE SOFTWARE.
-//
+/*
+ * Copyright Erik Dubbelboer. and other contributors. All rights reserved.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
 
 #include <stdio.h>          /* printf()    */
 #include <stdlib.h>         /* exit()      */
@@ -91,7 +91,7 @@ char* lua_error_handler =
 
 static void http_error(webclient_t* web, int status, const char* message) {
   size_t size   = strlen(message);
-  char*  buffer = malloc(4096 + size);
+  char*  buffer = (char*)pool_malloc(&web->pool, 4096 + size);
   int    n      = sprintf(
     buffer,
     "HTTP/1.1 %d %s\r\n"
@@ -111,15 +111,19 @@ static void http_error(webclient_t* web, int status, const char* message) {
   /* There will always be enough room for this. */
   strcat(buffer, message);
 
-  webserver_respond(web, buffer, n + size, free, 0);
+  webserver_respond(web, buffer, n + size, 0);
 }
 
 
 static int clua_shutdown(lua_State* L) {
   (void)L;
 
-  webserver_stop(&server_http);
-  webserver_stop(&server_https);
+  if (server_http.loop) {
+    webserver_stop(&server_http);
+  }
+  if (server_https.loop) {
+    webserver_stop(&server_https);
+  }
   
   UV_CHECK(uv_timer_stop(&print));
 
@@ -358,7 +362,13 @@ static void on_webserver_handle(webclient_t* web, int https) {
 
   response = sdscatlen(response, body, body_size);
 
-  webserver_respond(web, response, sdslen(response), (webserver_free_cb)sdsfree, 0);
+  /* Add the response to the memory pool for this connection.
+   * This will make sure it automatically gets freed once
+   * the connection terminates.
+   */
+  pool_add(&web->pool, response, (pool_free_cb)sdsfree);
+
+  webserver_respond(web, response, sdslen(response), 0);
 
   /* Return the stack to the starting state. */
   lua_pop(entry->L, lua_gettop(entry->L) - 2);
@@ -415,27 +425,14 @@ int main(int argc, char* argv[]) {
     exit(1);
   }
   
-  const char* http_ip       = json_object_dotget_string(config, "http.ip"      );
-  int         http_port     = json_object_dotget_number(config, "http.port"    );
-  const char* https_ip      = json_object_dotget_string(config, "https.ip"     );
-  int         https_port    = json_object_dotget_number(config, "https.port"   );
-  const char* https_pemfile = json_object_dotget_string(config, "https.pemfile");
-  const char* https_ciphers = json_object_dotget_string(config, "https.ciphers");
-
-  if (!http_ip  || (http_port  <= 0) ||
-      !https_ip || (https_port <= 0) ||
-      !https_pemfile || !https_ciphers
-  ) {
-    printf("invalid config\n");
-    exit(1);
-  }
-
-
+  
   int cachesize = json_object_get_number(config, "cachesize");
 
   if (cachesize <= 0) {
     cachesize = 64;
   }
+
+  LRU_INIT(&scriptlru, cachesize);
 
 
 #if !defined(_MSC_VER)
@@ -469,9 +466,6 @@ int main(int argc, char* argv[]) {
 #endif  /* !defined(_MSC_VER) */
 
 
-  LRU_INIT(&scriptlru, cachesize);
-
-
   loop = uv_default_loop();
   int err;
 
@@ -480,25 +474,52 @@ int main(int argc, char* argv[]) {
   UV_CHECK(uv_timer_start(&print, on_print, 6000, 6000));
 
 
-  server_http.loop      = loop;
-  server_http.handle_cb = on_webserver_handle_http;
-  server_http.close_cb  = on_webserver_close;
-  server_http.error_cb  = 0;
-  
-  if ((err = webserver_start(&server_http, http_ip, http_port)) != 0) {
-    printf("%s\n", webserver_error(&server_http));
-    exit(1);
+  if (json_object_dotget_string(config, "http.ip")) {
+    const char* http_ip   = json_object_dotget_string(config, "http.ip"  );
+    int         http_port = json_object_dotget_number(config, "http.port");
+
+    if (!http_ip || (http_port  <= 0)) {
+      printf("invalid config\n");
+      exit(1);
+    }
+
+    server_http.loop      = loop;
+    server_http.handle_cb = on_webserver_handle_http;
+    server_http.close_cb  = on_webserver_close;
+    server_http.error_cb  = 0;
+    
+    if ((err = webserver_start(&server_http, http_ip, http_port)) != 0) {
+      printf("%s\n", webserver_error(&server_http));
+      exit(1);
+    }
+  } else {
+    server_http.loop = 0;
   }
 
 
-  server_https.loop      = loop;
-  server_https.handle_cb = on_webserver_handle_https;
-  server_https.close_cb  = on_webserver_close;
-  server_https.error_cb  = on_webserver_error;
+  if (json_object_dotget_string(config, "https.ip")) {
+    const char* https_ip      = json_object_dotget_string(config, "https.ip"     );
+    int         https_port    = json_object_dotget_number(config, "https.port"   );
+    const char* https_pemfile = json_object_dotget_string(config, "https.pemfile");
+    const char* https_ciphers = json_object_dotget_string(config, "https.ciphers");
 
-  if ((err = webserver_start_ssl(&server_https, https_ip, https_port, https_pemfile, https_ciphers)) != 0) {
-    printf("%s\n", webserver_error(&server_https));
-    exit(1);
+    if (!https_ip      || (https_port <= 0) ||
+        !https_pemfile || !https_ciphers
+    ) {
+      printf("invalid config\n");
+      exit(1);
+    }
+    server_https.loop      = loop;
+    server_https.handle_cb = on_webserver_handle_https;
+    server_https.close_cb  = on_webserver_close;
+    server_https.error_cb  = on_webserver_error;
+
+    if ((err = webserver_start_ssl(&server_https, https_ip, https_port, https_pemfile, https_ciphers)) != 0) {
+      printf("%s\n", webserver_error(&server_https));
+      exit(1);
+    }
+  } else {
+    server_https.loop = 0;
   }
 
 
