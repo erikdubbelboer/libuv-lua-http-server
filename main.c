@@ -1,23 +1,23 @@
-//
-// Copyright Erik Dubbelboer. and other contributors. All rights reserved.
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to
-// deal in the Software without restriction, including without limitation the
-// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-// sell copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-// IN THE SOFTWARE.
-//
+/*
+ * Copyright Erik Dubbelboer. and other contributors. All rights reserved.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
 
 #include <stdio.h>          /* printf()    */
 #include <stdlib.h>         /* exit()      */
@@ -90,7 +90,7 @@ char* lua_error_handler =
 
 static void http_error(webclient_t* web, int status, const char* message) {
   size_t size   = strlen(message);
-  char*  buffer = malloc(4096 + size);
+  char*  buffer = (char*)pool_malloc(&web->pool, 4096 + size);
   int    n      = sprintf(
     buffer,
     "HTTP/1.1 %d %s\r\n"
@@ -110,7 +110,7 @@ static void http_error(webclient_t* web, int status, const char* message) {
   /* There will always be enough room for this. */
   strcat(buffer, message);
 
-  webserver_respond(web, buffer, n + size, free, 0);
+  webserver_respond(web, buffer, n + size, 0);
 }
 
 
@@ -353,7 +353,13 @@ static void on_webserver_handle(webclient_t* web) {
 
   response = sdscatlen(response, body, body_size);
 
-  webserver_respond(web, response, sdslen(response), (webserver_free_cb)sdsfree, 0);
+  /* Add the response to the memory pool for this connection.
+   * This will make sure it automatically gets freed once
+   * the connection terminates.
+   */
+  pool_add(&web->pool, response, (pool_free_cb)sdsfree);
+
+  webserver_respond(web, response, sdslen(response), 0);
 
   /* Return the stack to the starting state. */
   lua_pop(entry->L, lua_gettop(entry->L) - 2);
@@ -381,7 +387,7 @@ static void on_print(uv_timer_t* handle, int status) {
     printed = 0;
   }
 
-  printf("%6u   %6u\n", handled, server_http.connected);
+  printf("%6u   %6u\n", handled, server.connected);
   handled = 0;
 }
 

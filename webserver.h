@@ -1,23 +1,23 @@
-//
-// Copyright Erik Dubbelboer. and other contributors. All rights reserved.
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to
-// deal in the Software without restriction, including without limitation the
-// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-// sell copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-// IN THE SOFTWARE.
-//
+/*
+ * Copyright Erik Dubbelboer. and other contributors. All rights reserved.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
 
 #ifndef _WEBSERVER_H_
 #define _WEBSERVER_H_
@@ -27,17 +27,25 @@
 
 #include "uv.h"
 #include "http_parser.h"
+#include "pool.h"
 
 
-#ifndef WEBSERVER_READ_TIMEOUT
-# define WEBSERVER_READ_TIMEOUT      (10*1000)
-#endif
-#ifndef WEBSERVER_WRITE_TIMEOUT
-# define WEBSERVER_WRITE_TIMEOUT     (10*1000)
-#endif
-#ifndef WEBSERVER_KEEPALIVE_TIMEOUT
-# define WEBSERVER_KEEPALIVE_TIMEOUT (5 *1000)
-#endif
+/* Various timeouts. */
+#define WEBSERVER_READ_TIMEOUT      (10*1000)
+#define WEBSERVER_WRITE_TIMEOUT     (10*1000)
+#define WEBSERVER_KEEPALIVE_TIMEOUT (5 *1000)
+
+/* Headers which the webserver should extract
+ * from the request.
+ *
+ * Format:
+ * Variable name, lower case header string, maximum length.
+ */
+#define WEBSERVER_HEADERS(XX)              \
+  XX(cookie       , "cookie"       , 4096) \
+  XX(agent        , "user-agent"   , 1024) \
+  /* Referrer is misspelled in HTTP. */    \
+  XX(referrer     , "referer"      , 1024)
 
 
 struct webserver_s;
@@ -45,7 +53,6 @@ struct webclient_s;
 
 typedef void (*webserver_handle_cb)(struct webclient_s* client);
 typedef void (*webserver_close_cb )(struct webclient_s* client);
-typedef void (*webserver_free_cb  )(void* buffer);
 typedef void (*webserver_stop_cb  )(struct webserver_s* server);
 typedef void (*webserver_error_cb )(const char* error);
 
@@ -72,6 +79,7 @@ typedef struct webserver_s {
   /* Readonly: */
   int connected;  /* Number of connected clients. */
 
+
   /* Fields for internal use: */
   uv_stream_t*       _handle;
   int                _closing;
@@ -86,9 +94,14 @@ typedef struct webclient_s {
   uint8_t method;   /* One of the http_method enum members from http_parser.h */
   uint8_t version;  /* HTTP version, (major * 10) + minor                     */
 
-  char cookie  [1024*2];
-  char agent   [1024];
-  char referrer[1024];
+#define WEBSERVER_DEF(name, str, size) char* name;
+  WEBSERVER_HEADERS(WEBSERVER_DEF)
+#undef WEBSERVER_DEF
+
+  /* All allocations for this client can be done using this pool.
+   * It will be freed when the client disconnects.
+   */
+  pool_t pool;
 
   webserver_t* server;
 
@@ -103,7 +116,7 @@ typedef struct webclient_s {
  * timeout: Write timeout, 0 means WEBSERVER_WRITE_TIMEOUT.
  *          It is advised to set a higher timeout when writing large amounts of data.
  */
-void        webserver_respond   (webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout);
+void        webserver_respond   (webclient_t* client, char* response, size_t size, uint32_t timeout);
 int         webserver_start     (webserver_t* server, const char* ip, int port);
 int         webserver_start2    (webserver_t* server, uv_pipe_t* pipe);
 int         webserver_stop      (webserver_t* server);

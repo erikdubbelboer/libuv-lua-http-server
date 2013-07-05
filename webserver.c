@@ -1,25 +1,24 @@
-//
-// Copyright Erik Dubbelboer. and other contributors. All rights reserved.
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files (the "Software"), to
-// deal in the Software without restriction, including without limitation the
-// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
-// sell copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions:
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-// IN THE SOFTWARE.
-//
+/*
+ * Copyright Erik Dubbelboer. and other contributors. All rights reserved.
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
 
-#include <stdlib.h>  /* malloc(), free()     */
 #include <assert.h>  /* assert()             */
 #include <string.h>  /* strncat(), strncpy() */
 #include <stdio.h>   /* snprintf()           */
@@ -43,9 +42,7 @@ typedef struct webio_s {
   http_parser parser;
   uv_timer_t  timeout;
   
-  uv_write_t        write_req;
-  char*             write_data;
-  webserver_free_cb write_free;
+  uv_write_t write_req;
 
 #ifdef HAVE_KEEP_ALIVE
   int keep_alive;
@@ -64,6 +61,9 @@ static http_parser_settings parser_settings;
 static void after_close_timeout(uv_handle_t* handle) {
   webio_t* io = (webio_t*)handle->data;
 
+  /* Free all memory that was allocated for this connection. */
+  pool_reset(&io->client.pool);
+
   free(io);
 }
 
@@ -74,11 +74,6 @@ static void after_close(uv_handle_t* handle) {
   --io->client.server->connected;
 
   assert(io->client.server->connected >= 0);
-
-  if (io->write_data) {
-    io->write_free(io->write_data);
-    io->write_data = 0;
-  }
 
   io->client.server->close_cb(&io->client);
 
@@ -119,13 +114,6 @@ static void after_write(uv_write_t* req, int status) {
   assert((status == 0) || (status != UV_ECANCELED));
   (void)status;  /* For release builds. */
 
-  if (io->write_data) {
-    io->write_free(io->write_data);
-    io->write_data = 0;
-  } else {
-    return;
-  }
-
   /* Stop the write timeout. */
   uv_timer_stop(&io->timeout);
 
@@ -156,25 +144,19 @@ static void after_write(uv_write_t* req, int status) {
 }
 
 
-void webserver_respond(webclient_t* client, char* response, size_t size, webserver_free_cb free_cb, uint32_t timeout) {
+void webserver_respond(webclient_t* client, char* response, size_t size, uint32_t timeout) {
   webio_t* io = client->_io;
 
   /* Start a write timeout. */
   uv_timer_start(&io->timeout, on_timeout, timeout ? timeout : WEBSERVER_WRITE_TIMEOUT, 0);
 
   if (response) {
-    io->write_data = response;
-    io->write_free = free_cb;
-    uv_buf_t buf   = uv_buf_init(response, size);
+    uv_buf_t buf = uv_buf_init(response, size);
   
     if (uv_write(&io->write_req, (uv_stream_t*)&io->handle, &buf, 1, after_write) != 0) {
-      free_cb(response);
-
       do_close(io);
     }
   } else {
-    free_cb(response);
-
     do_close(io);
   }
 }
@@ -223,22 +205,22 @@ static int on_header_field(http_parser *p, const char *buf, size_t len) {
   webio_t* io = (webio_t*)p->data;
 
   /* "If src contains n or more bytes, strncat() writes n+1 bytes to dest."
-   * Because of this we need to do sizeof() - 1.
+   * Because of this we need to do size - 1.
    */
 
-  if (strncasecmp(buf, "cookie", len) == 0) {
-    io->header      = io->client.cookie;
-    io->header_size = sizeof(io->client.cookie) - 1;
+  if (0) {
   }
-  else if (strncasecmp(buf, "user-agent", len) == 0) {
-    io->header      = io->client.agent;
-    io->header_size = sizeof(io->client.agent) - 1;
+#define WEBSERVER_PARSE(name, str, size)                            \
+  else if (strncasecmp(buf, str, len) == 0) {                       \
+    if (!io->client.name) {                                         \
+      io->client.name = (char*)pool_malloc(&io->client.pool, size); \
+      io->client.name[0] = 0;                                       \
+    }                                                               \
+    io->header      = io->client.name;                              \
+    io->header_size = size - 1;                                     \
   }
-  /* Referrer is misspelled in HTTP. */
-  else if (strncasecmp(buf, "referer", len) == 0) {
-    io->header      = io->client.referrer;
-    io->header_size = sizeof(io->client.referrer) - 1;
-  }
+  WEBSERVER_HEADERS(WEBSERVER_PARSE)
+#undef WEBSERVER_PARSE
   else {
     io->header = 0;
   }
@@ -264,11 +246,14 @@ static int on_url(http_parser *p, const char *buf, size_t len) {
 static int on_message_begin(http_parser *p) {
   webio_t* io = (webio_t*)p->data;
   
-  io->client.method      = p->method;
-  io->client.url[0]      = 0;
-  io->client.cookie[0]   = 0;
-  io->client.agent[0]    = 0;
-  io->client.referrer[0] = 0;
+  io->client.method = p->method;
+
+#define WEBSERVER_SET(name, str, size) \
+  if (io->client.name) {               \
+    io->client.name[0] = 0;            \
+  }
+  WEBSERVER_HEADERS(WEBSERVER_SET)
+#undef WEBSERVER_SET
 
 #ifdef HAVE_KEEP_ALIVE
   io->keep_alive = 0;
@@ -304,11 +289,19 @@ static void on_read(uv_stream_t* tcp, ssize_t nread, uv_buf_t buf) {
     do_close(io);
   }
 
-  free(buf.base);
+  pool_free(&io->client.pool, buf.base);
 }
 
 
-static uv_buf_t on_alloc(uv_handle_t* handle, size_t suggested_size) {
+static uv_buf_t on_alloc_client(uv_handle_t* handle, size_t suggested_size) {
+  webio_t* io = (webio_t*)handle->data;
+
+  char* buf = (char*)pool_malloc(&io->client.pool, suggested_size);
+  return uv_buf_init(buf, suggested_size);
+}
+
+
+static uv_buf_t on_alloc_server(uv_handle_t* handle, size_t suggested_size) {
   (void)handle;
 
   char* buf = (char*)malloc(suggested_size);
@@ -332,6 +325,8 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
     io->client._io     = io;
     io->write_req.data = io;
 
+    pool_init(&io->client.pool);
+
     struct sockaddr_in sockname;
     int                namelen = sizeof(sockname);
 
@@ -342,7 +337,7 @@ static void accept_connection(uv_stream_t* handle, webio_t* io) {
 
     io->client.ip = sockname.sin_addr.s_addr;
     
-    if (uv_read_start((uv_stream_t*)&io->handle, on_alloc, on_read) != 0) {
+    if (uv_read_start((uv_stream_t*)&io->handle, on_alloc_client, on_read) != 0) {
       do_close(io);
     }
   }
@@ -355,8 +350,7 @@ static void on_tcp_connection(uv_stream_t* handle, int status) {
   assert(status == 0);
   (void)status;  /* For release builds. */
 
-  webio_t* io = (webio_t*)malloc(sizeof(*io));
-  memset(io, 0, sizeof(*io));
+  webio_t* io = (webio_t*)calloc(1, sizeof(*io));
 
   uv_tcp_init(server->loop, &io->handle.tcp);
 
@@ -380,8 +374,7 @@ static void on_pipe_connection(uv_pipe_t *handle, ssize_t nread, uv_buf_t buf, u
   /* We ignore buf so free it right away. */
   free(buf.base);
 
-  webio_t* io = (webio_t*)malloc(sizeof(*io));
-  memset(io, 0, sizeof(*io));
+  webio_t* io = (webio_t*)calloc(1, sizeof(*io));
 
   uv_pipe_init(server->loop, &io->handle.pipe, 0);
 
@@ -392,7 +385,10 @@ static void on_pipe_connection(uv_pipe_t *handle, ssize_t nread, uv_buf_t buf, u
 }
 
 
-static void start_common() {
+static void start_common(webserver_t* server) {
+  server->connected = 0;
+  server->_closing  = 0;
+
   /* It doesn't matter if this happens more then once when starting multiple webservers.
    * No internal state or anything is stored so it will always set the struct to the same state.
    */
@@ -412,14 +408,9 @@ int webserver_start(webserver_t* server, const char* ip, int port) {
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common();
+  start_common(server);
 
-  server->connected = 0;
-  server->_handle   = (uv_stream_t*)malloc(sizeof(uv_tcp_t));
-  server->_closing  = 0;
-
-  memset(server->_handle, 0, sizeof(uv_tcp_t));
-
+  server->_handle       = (uv_stream_t*)calloc(1, sizeof(uv_tcp_t));
   server->_handle->data = server;
 
   if (uv_tcp_init(server->loop, (uv_tcp_t*)server->_handle) != 0) {
@@ -443,15 +434,12 @@ int webserver_start2(webserver_t* server, uv_pipe_t* pipe) {
   assert(server->handle_cb);
   assert(server->close_cb );
 
-  start_common();
+  start_common(server);
 
-  server->connected = 0;
-  server->_handle   = (uv_stream_t*)pipe;
-  server->_closing  = 0;
-
+  server->_handle       = (uv_stream_t*)pipe;
   server->_handle->data = server;
   
-  if (uv_read2_start(server->_handle, on_alloc, on_pipe_connection) != 0) {
+  if (uv_read2_start(server->_handle, on_alloc_server, on_pipe_connection) != 0) {
     return 1;
   }
 

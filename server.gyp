@@ -13,6 +13,7 @@
 
       'sources': [
         'sds.c',
+        'pool.c',
         'webserver.c',
         'main.c'
       ],
